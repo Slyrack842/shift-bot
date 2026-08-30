@@ -11,3 +11,6 @@ multidict==6.7.1
 propcache==0.5.2
 python-dotenv==1.2.2
 yarl==1.24.5
+discord.py
+aiosqlite
+python-dotenv
