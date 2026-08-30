@@ -21,16 +21,16 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- НАСТРОЙКИ ---
-REPORT_CHANNEL_ID = 1533758067513098408   # ID канала для уведомлений и отчётов
-REPORT_USER_ID = 775396551936704533      # ID пользователя для отчётов
+# --- SETTINGS ---
+REPORT_CHANNEL_ID = 1533758067513098408   # Channel ID for notifications and reports
+REPORT_USER_ID = 775396551936704533      # User ID for reports
 
-# Настройки напоминаний
-REMINDER_HOURS = 4   # Через сколько часов отправлять первое напоминание
-URGENT_HOURS = 8     # Через сколько часов отправлять срочное напоминание
-CHECK_INTERVAL = 30  # Проверять каждые 30 минут
+# Reminder settings
+REMINDER_HOURS = 4   # Hours before sending first reminder
+URGENT_HOURS = 8     # Hours before sending urgent reminder
+CHECK_INTERVAL = 30  # Check every 30 minutes
 
-# --- БАЗА ДАННЫХ ---
+# --- DATABASE ---
 async def init_db():
     async with aiosqlite.connect('shifts.db') as db:
         await db.execute('''
@@ -103,7 +103,7 @@ async def end_shift(user_id, guild_id):
         hours = duration.total_seconds() / 3600
         return f"{int(hours)}h {int((hours % 1) * 60)}min"
 
-# --- ФУНКЦИЯ ДЛЯ ФОРМАТИРОВАНИЯ ВРЕМЕНИ ---
+# --- HELPER FUNCTIONS ---
 def format_time(seconds):
     if seconds is None or seconds == 0:
         return "0h 0min"
@@ -115,9 +115,9 @@ def format_time(seconds):
         return f"{hours} h"
     return f"{hours} h {minutes} min"
 
-# --- УВЕДОМЛЕНИЕ О НАЧАЛЕ СМЕНЫ ---
+# --- NOTIFICATIONS (ENGLISH) ---
 async def send_shift_start_notification(user_id, username, guild_id):
-    """Отправляет уведомление о начале смены в канал"""
+    """Sends shift start notification to the channel"""
     try:
         channel = bot.get_channel(REPORT_CHANNEL_ID)
         if channel:
@@ -133,9 +133,8 @@ async def send_shift_start_notification(user_id, username, guild_id):
     except Exception as e:
         print(f"❌ Error sending start notification: {e}")
 
-# --- УВЕДОМЛЕНИЕ О КОНЦЕ СМЕНЫ ---
 async def send_shift_end_notification(user_id, username, duration, guild_id):
-    """Отправляет уведомление о завершении смены в канал"""
+    """Sends shift end notification to the channel"""
     try:
         channel = bot.get_channel(REPORT_CHANNEL_ID)
         if channel:
@@ -152,9 +151,9 @@ async def send_shift_end_notification(user_id, username, duration, guild_id):
     except Exception as e:
         print(f"❌ Error sending end notification: {e}")
 
-# --- НАПОМИНАНИЯ О ДЛИТЕЛЬНОЙ СМЕНЕ ---
+# --- LONG SHIFT REMINDERS ---
 async def check_long_shifts():
-    """Проверяет активные смены и отправляет напоминания в ЛС"""
+    """Checks active shifts and sends reminders via DM"""
     await bot.wait_until_ready()
     
     while not bot.is_closed():
@@ -201,7 +200,7 @@ async def check_long_shifts():
                                     inline=False
                                 )
                                 await user.send(embed=embed)
-                                print(f"✅ Sent normal reminder to {username}")
+                                print(f"✅ Normal reminder sent to {username}")
                                 
                             elif reminder_type == "urgent":
                                 embed = discord.Embed(
@@ -216,7 +215,7 @@ async def check_long_shifts():
                                     inline=False
                                 )
                                 await user.send(embed=embed)
-                                print(f"✅ Sent urgent reminder to {username}")
+                                print(f"✅ Urgent reminder sent to {username}")
                             
                             new_reminder_value = 2 if reminder_type == "urgent" else 1
                             async with aiosqlite.connect('shifts.db') as db:
@@ -236,7 +235,7 @@ async def check_long_shifts():
             print(f"❌ Error in check_long_shifts: {e}")
             await asyncio.sleep(60)
 
-# --- ОБНОВЛЕНИЕ СТАТУСА ---
+# --- STATUS UPDATE ---
 async def update_status():
     await bot.wait_until_ready()
     while not bot.is_closed():
@@ -254,9 +253,9 @@ async def update_status():
             pass
         await asyncio.sleep(30)
 
-# --- ФУНКЦИЯ ДЛЯ ОТПРАВКИ ОТЧЁТА ---
+# --- MONTHLY REPORT ---
 async def send_monthly_report():
-    """Отправляет отчёт за месяц в указанный канал"""
+    """Sends monthly report to the channel"""
     await bot.wait_until_ready()
     
     await asyncio.sleep(10)
@@ -357,7 +356,7 @@ async def send_monthly_report():
             print(f"❌ Error in monthly report: {e}")
             await asyncio.sleep(3600)
 
-# --- СОЗДАНИЕ ПАНЕЛИ ---
+# --- SHIFT PANEL ---
 async def create_shift_panel(interaction: discord.Interaction, edit: bool = False):
     try:
         async with aiosqlite.connect('shifts.db') as db:
@@ -412,14 +411,14 @@ async def create_shift_panel(interaction: discord.Interaction, edit: bool = Fals
         if edit:
             await interaction.edit_original_response(embed=embed, view=view)
         else:
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            await interaction.followup.send(embed=embed, view=view)
             
     except Exception as e:
         print(f"❌ Error creating panel: {e}")
         if not edit:
-            await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-# --- КНОПКИ ---
+# --- BUTTONS ---
 class ShiftButtons(discord.ui.View):
     def __init__(self, is_active, user_id):
         super().__init__(timeout=120)
@@ -450,7 +449,7 @@ class ShiftButtons(discord.ui.View):
             return False
         return True
 
-# --- КОМАНДЫ ---
+# --- COMMANDS ---
 @bot.event
 async def on_ready():
     await init_db()
@@ -466,14 +465,20 @@ async def on_ready():
     
     bot.loop.create_task(update_status())
     bot.loop.create_task(check_long_shifts())
+    bot.loop.create_task(send_monthly_report())
 
-# --- ОСНОВНЫЕ КОМАНДЫ ---
+# --- MAIN COMMANDS ---
 @bot.tree.command(name='shift', description='📋 Manage your shift')
 async def shift_panel_command(interaction: discord.Interaction):
-    await create_shift_panel(interaction, edit=False)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await create_shift_panel(interaction, edit=False)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name='onshift', description='👥 Who is on shift right now')
 async def on_shift(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     try:
         active_users = await get_active_shifts(interaction.guild_id)
         
@@ -511,12 +516,13 @@ async def on_shift(interaction: discord.Interaction):
         else:
             embed.description = "🟢 No one is on shift right now"
         
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name='stats', description='📊 My shift statistics')
 async def my_stats(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     try:
         async with aiosqlite.connect('shifts.db') as db:
             today = datetime.now().date().isoformat()
@@ -560,9 +566,9 @@ async def my_stats(interaction: discord.Interaction):
             inline=True
         )
         embed.set_footer(text=f"ID: {interaction.user.id}")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name='user-stats', description='📊 Statistics of a specific employee')
 async def user_stats(interaction: discord.Interaction, user: discord.Member):
@@ -771,7 +777,7 @@ async def test_report(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}")
 
-# --- ОБРАБОТЧИКИ КНОПОК ---
+# --- BUTTON HANDLERS ---
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     if interaction.type != discord.InteractionType.component:
@@ -795,7 +801,6 @@ async def on_interaction(interaction: discord.Interaction):
                 )
                 await interaction.followup.send(embed=embed, ephemeral=True)
                 
-                # Отправляем уведомление в канал
                 await send_shift_start_notification(
                     interaction.user.id,
                     interaction.user.name,
@@ -818,7 +823,6 @@ async def on_interaction(interaction: discord.Interaction):
                 )
                 await interaction.followup.send(embed=embed, ephemeral=True)
                 
-                # Отправляем уведомление в канал
                 await send_shift_end_notification(
                     interaction.user.id,
                     interaction.user.name,
@@ -844,7 +848,7 @@ async def on_interaction(interaction: discord.Interaction):
         except:
             pass
 
-# --- ЗАПУСК ---
+# --- LAUNCH ---
 if __name__ == '__main__':
     try:
         bot.run(TOKEN)
