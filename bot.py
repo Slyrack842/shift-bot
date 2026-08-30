@@ -21,14 +21,18 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- НАСТРОЙКИ ДЛЯ ОТЧЁТОВ ---
-REPORT_CHANNEL_ID = 1533758067513098408   # ID канала для отчётов
-REPORT_USER_ID = 775396551936704533      # ID пользователя для отчётов (ЗАМЕНИТЕ НА СВОЙ!)
+# --- НАСТРОЙКИ ---
+REPORT_CHANNEL_ID = 1533758067513098408   # ID канала для уведомлений и отчётов
+REPORT_USER_ID = 775396551936704533      # ID пользователя для отчётов
+
+# Настройки напоминаний
+REMINDER_HOURS = 4   # Через сколько часов отправлять первое напоминание
+URGENT_HOURS = 8     # Через сколько часов отправлять срочное напоминание
+CHECK_INTERVAL = 30  # Проверять каждые 30 минут
 
 # --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect('shifts.db') as db:
-        # Таблица смен
         await db.execute('''
             CREATE TABLE IF NOT EXISTS shifts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,10 +41,10 @@ async def init_db():
                 start_time TEXT,
                 end_time TEXT,
                 guild_id INTEGER,
-                is_active INTEGER DEFAULT 1
+                is_active INTEGER DEFAULT 1,
+                last_reminder INTEGER DEFAULT 0
             )
         ''')
-        # Таблица для хранения даты последней очистки
         await db.execute('''
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -57,6 +61,13 @@ async def get_active_shifts(guild_id):
         )
         return await cursor.fetchall()
 
+async def get_all_active_shifts():
+    async with aiosqlite.connect('shifts.db') as db:
+        cursor = await db.execute(
+            'SELECT user_id, username, start_time, guild_id, id FROM shifts WHERE is_active = 1'
+        )
+        return await cursor.fetchall()
+
 async def start_shift(user_id, username, guild_id):
     async with aiosqlite.connect('shifts.db') as db:
         cursor = await db.execute(
@@ -67,7 +78,7 @@ async def start_shift(user_id, username, guild_id):
             return False
         now = datetime.now().isoformat()
         await db.execute(
-            'INSERT INTO shifts (user_id, username, start_time, guild_id, is_active) VALUES (?, ?, ?, ?, 1)',
+            'INSERT INTO shifts (user_id, username, start_time, guild_id, is_active, last_reminder) VALUES (?, ?, ?, ?, 1, 0)',
             (user_id, username, now, guild_id)
         )
         await db.commit()
@@ -104,122 +115,126 @@ def format_time(seconds):
         return f"{hours} h"
     return f"{hours} h {minutes} min"
 
-# --- ФУНКЦИЯ ДЛЯ ОТПРАВКИ ОТЧЁТА ---
-async def send_monthly_report():
-    """Отправляет отчёт за месяц в указанный канал"""
+# --- УВЕДОМЛЕНИЕ О НАЧАЛЕ СМЕНЫ ---
+async def send_shift_start_notification(user_id, username, guild_id):
+    """Отправляет уведомление о начале смены в канал"""
+    try:
+        channel = bot.get_channel(REPORT_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title="🟢 Shift Started",
+                description=f"**{username}** started their shift at {datetime.now().strftime('%H:%M')}",
+                color=discord.Color.green(),
+                timestamp=datetime.now()
+            )
+            embed.set_footer(text=f"User ID: {user_id}")
+            await channel.send(embed=embed)
+            print(f"✅ Start notification sent for {username}")
+    except Exception as e:
+        print(f"❌ Error sending start notification: {e}")
+
+# --- УВЕДОМЛЕНИЕ О КОНЦЕ СМЕНЫ ---
+async def send_shift_end_notification(user_id, username, duration, guild_id):
+    """Отправляет уведомление о завершении смены в канал"""
+    try:
+        channel = bot.get_channel(REPORT_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title="🔴 Shift Ended",
+                description=f"**{username}** ended their shift",
+                color=discord.Color.red(),
+                timestamp=datetime.now()
+            )
+            embed.add_field(name="⏱️ Duration", value=duration, inline=True)
+            embed.set_footer(text=f"User ID: {user_id}")
+            await channel.send(embed=embed)
+            print(f"✅ End notification sent for {username}")
+    except Exception as e:
+        print(f"❌ Error sending end notification: {e}")
+
+# --- НАПОМИНАНИЯ О ДЛИТЕЛЬНОЙ СМЕНЕ ---
+async def check_long_shifts():
+    """Проверяет активные смены и отправляет напоминания в ЛС"""
     await bot.wait_until_ready()
-    
-    # Ждём, пока бот полностью запустится
-    await asyncio.sleep(10)
     
     while not bot.is_closed():
         try:
-            now = datetime.now()
+            active_shifts = await get_all_active_shifts()
             
-            # Проверяем, не наступил ли конец месяца (последний день, 23:50)
-            # Или первый день нового месяца (для отчёта за прошлый месяц)
-            is_last_day = now.day == 1 and now.hour == 0 and now.minute < 5
-            
-            if is_last_day:
-                # Берём данные за прошлый месяц
-                month_start = (now - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0)
-                month_end = now.replace(day=1, hour=0, minute=0, second=0)
+            for user_id, username, start_time_str, guild_id, shift_id in active_shifts:
+                start_time = datetime.fromisoformat(start_time_str)
+                duration = datetime.now() - start_time
+                hours = duration.total_seconds() / 3600
                 
-                # Получаем статистику за месяц
                 async with aiosqlite.connect('shifts.db') as db:
-                    cursor = await db.execute('''
-                        SELECT 
-                            user_id,
-                            username,
-                            COUNT(*) as shift_count,
-                            SUM(strftime('%s', end_time) - strftime('%s', start_time)) as total_seconds
-                        FROM shifts 
-                        WHERE guild_id IS NOT NULL 
-                        AND is_active = 0 
-                        AND end_time IS NOT NULL
-                        AND start_time >= ?
-                        AND end_time <= ?
-                        GROUP BY user_id, username
-                        ORDER BY total_seconds DESC
-                    ''', (month_start.isoformat(), month_end.isoformat()))
-                    stats = await cursor.fetchall()
-                    
-                    # Удаляем старые смены (очистка)
-                    await db.execute(
-                        'DELETE FROM shifts WHERE end_time < ? AND is_active = 0',
-                        (month_end.isoformat(),)
+                    cursor = await db.execute(
+                        'SELECT last_reminder FROM shifts WHERE id = ?',
+                        (shift_id,)
                     )
-                    await db.commit()
+                    result = await cursor.fetchone()
+                    last_reminder = result[0] if result else 0
                 
-                # Создаём embed с отчётом
-                embed = discord.Embed(
-                    title=f"📊 Monthly Report - {month_start.strftime('%B %Y')}",
-                    color=discord.Color.gold(),
-                    timestamp=datetime.now()
-                )
+                should_remind = False
+                reminder_type = ""
                 
-                if stats:
-                    total_employees = len(stats)
-                    total_shifts = sum(s[2] for s in stats)
-                    total_seconds = sum(s[3] for s in stats if s[3])
-                    
-                    embed.add_field(
-                        name="📈 Summary",
-                        value=f"Employees: {total_employees}\nTotal Shifts: {total_shifts}\nTotal Hours: {format_time(total_seconds)}",
-                        inline=False
-                    )
-                    
-                    # Топ-10 сотрудников
-                    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-                    top_list = []
-                    for i, (user_id, username, shifts, seconds) in enumerate(stats[:10], 1):
-                        # Пробуем получить актуальный никнейм
-                        try:
-                            guild = bot.get_guild(1478824197357703281)  # ID вашего сервера
-                            member = guild.get_member(user_id) if guild else None
-                            display_name = member.display_name if member else username
-                        except:
-                            display_name = username
-                        
-                        top_list.append(f"{medals[i-1]} **{display_name}**\n   └ {shifts} shifts, {format_time(seconds)}")
-                    
-                    embed.add_field(
-                        name="🏆 Top 10 Employees",
-                        value="\n\n".join(top_list),
-                        inline=False
-                    )
-                else:
-                    embed.description = "📭 No shifts recorded this month"
+                if hours >= URGENT_HOURS and last_reminder < 2:
+                    should_remind = True
+                    reminder_type = "urgent"
+                elif hours >= REMINDER_HOURS and last_reminder == 0:
+                    should_remind = True
+                    reminder_type = "normal"
                 
-                embed.set_footer(text="Monthly cleanup completed")
-                
-                # Отправляем отчёт в канал
-                try:
-                    # Отправляем в указанный канал
-                    if REPORT_CHANNEL_ID:
-                        channel = bot.get_channel(REPORT_CHANNEL_ID)
-                        if channel:
-                            await channel.send(embed=embed)
-                    
-                    # Отправляем в личные сообщения (если указан ID пользователя)
-                    if REPORT_USER_ID:
-                        user = await bot.fetch_user(REPORT_USER_ID)
+                if should_remind:
+                    try:
+                        user = await bot.fetch_user(user_id)
                         if user:
-                            await user.send(embed=embed)
-                except Exception as e:
-                    print(f"❌ Error sending report: {e}")
-                
-                print(f"✅ Monthly report sent and old shifts deleted")
-                
-                # Ждём сутки, чтобы не отправлять отчёт повторно
-                await asyncio.sleep(86400)
+                            if reminder_type == "normal":
+                                embed = discord.Embed(
+                                    title="⏰ Shift Reminder",
+                                    description=f"⚠️ You've been on shift for **{int(hours)} hours**!",
+                                    color=discord.Color.orange(),
+                                    timestamp=datetime.now()
+                                )
+                                embed.add_field(
+                                    name="💡 Tip",
+                                    value=f"You've been working for over {REMINDER_HOURS} hours. Make sure to take breaks!",
+                                    inline=False
+                                )
+                                await user.send(embed=embed)
+                                print(f"✅ Sent normal reminder to {username}")
+                                
+                            elif reminder_type == "urgent":
+                                embed = discord.Embed(
+                                    title="🚨 URGENT: Long Shift Warning",
+                                    description=f"⚠️ You've been on shift for **{int(hours)} hours**!",
+                                    color=discord.Color.red(),
+                                    timestamp=datetime.now()
+                                )
+                                embed.add_field(
+                                    name="💡 Important",
+                                    value=f"This is a serious reminder! You've been working for over {URGENT_HOURS} hours. Please consider ending your shift or taking a longer break.",
+                                    inline=False
+                                )
+                                await user.send(embed=embed)
+                                print(f"✅ Sent urgent reminder to {username}")
+                            
+                            new_reminder_value = 2 if reminder_type == "urgent" else 1
+                            async with aiosqlite.connect('shifts.db') as db:
+                                await db.execute(
+                                    'UPDATE shifts SET last_reminder = ? WHERE id = ?',
+                                    (new_reminder_value, shift_id)
+                                )
+                                await db.commit()
+                    except discord.Forbidden:
+                        print(f"❌ Cannot send DM to {username} (DMs disabled)")
+                    except Exception as e:
+                        print(f"❌ Error sending reminder to {username}: {e}")
             
-            # Проверяем каждый час
-            await asyncio.sleep(3600)
+            await asyncio.sleep(CHECK_INTERVAL * 60)
             
         except Exception as e:
-            print(f"❌ Error in monthly report: {e}")
-            await asyncio.sleep(3600)
+            print(f"❌ Error in check_long_shifts: {e}")
+            await asyncio.sleep(60)
 
 # --- ОБНОВЛЕНИЕ СТАТУСА ---
 async def update_status():
@@ -238,6 +253,109 @@ async def update_status():
         except:
             pass
         await asyncio.sleep(30)
+
+# --- ФУНКЦИЯ ДЛЯ ОТПРАВКИ ОТЧЁТА ---
+async def send_monthly_report():
+    """Отправляет отчёт за месяц в указанный канал"""
+    await bot.wait_until_ready()
+    
+    await asyncio.sleep(10)
+    
+    while not bot.is_closed():
+        try:
+            now = datetime.now()
+            
+            is_last_day = now.day == 1 and now.hour == 0 and now.minute < 5
+            
+            if is_last_day:
+                month_start = (now - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0)
+                month_end = now.replace(day=1, hour=0, minute=0, second=0)
+                
+                async with aiosqlite.connect('shifts.db') as db:
+                    cursor = await db.execute('''
+                        SELECT 
+                            user_id,
+                            username,
+                            COUNT(*) as shift_count,
+                            SUM(strftime('%s', end_time) - strftime('%s', start_time)) as total_seconds
+                        FROM shifts 
+                        WHERE guild_id IS NOT NULL 
+                        AND is_active = 0 
+                        AND end_time IS NOT NULL
+                        AND start_time >= ?
+                        AND end_time <= ?
+                        GROUP BY user_id, username
+                        ORDER BY total_seconds DESC
+                    ''', (month_start.isoformat(), month_end.isoformat()))
+                    stats = await cursor.fetchall()
+                    
+                    await db.execute(
+                        'DELETE FROM shifts WHERE end_time < ? AND is_active = 0',
+                        (month_end.isoformat(),)
+                    )
+                    await db.commit()
+                
+                embed = discord.Embed(
+                    title=f"📊 Monthly Report - {month_start.strftime('%B %Y')}",
+                    color=discord.Color.gold(),
+                    timestamp=datetime.now()
+                )
+                
+                if stats:
+                    total_employees = len(stats)
+                    total_shifts = sum(s[2] for s in stats)
+                    total_seconds = sum(s[3] for s in stats if s[3])
+                    
+                    embed.add_field(
+                        name="📈 Summary",
+                        value=f"Employees: {total_employees}\nTotal Shifts: {total_shifts}\nTotal Hours: {format_time(total_seconds)}",
+                        inline=False
+                    )
+                    
+                    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+                    top_list = []
+                    for i, (user_id, username, shifts, seconds) in enumerate(stats[:10], 1):
+                        try:
+                            guild = bot.get_guild(1478824197357703281)
+                            member = guild.get_member(user_id) if guild else None
+                            display_name = member.display_name if member else username
+                        except:
+                            display_name = username
+                        
+                        top_list.append(f"{medals[i-1]} **{display_name}**\n   └ {shifts} shifts, {format_time(seconds)}")
+                    
+                    embed.add_field(
+                        name="🏆 Top 10 Employees",
+                        value="\n\n".join(top_list),
+                        inline=False
+                    )
+                else:
+                    embed.description = "📭 No shifts recorded this month"
+                
+                embed.set_footer(text="Monthly cleanup completed")
+                
+                try:
+                    if REPORT_CHANNEL_ID:
+                        channel = bot.get_channel(REPORT_CHANNEL_ID)
+                        if channel:
+                            await channel.send(embed=embed)
+                    
+                    if REPORT_USER_ID:
+                        user = await bot.fetch_user(REPORT_USER_ID)
+                        if user:
+                            await user.send(embed=embed)
+                except Exception as e:
+                    print(f"❌ Error sending report: {e}")
+                
+                print(f"✅ Monthly report sent and old shifts deleted")
+                
+                await asyncio.sleep(86400)
+            
+            await asyncio.sleep(3600)
+            
+        except Exception as e:
+            print(f"❌ Error in monthly report: {e}")
+            await asyncio.sleep(3600)
 
 # --- СОЗДАНИЕ ПАНЕЛИ ---
 async def create_shift_panel(interaction: discord.Interaction, edit: bool = False):
@@ -346,16 +464,15 @@ async def on_ready():
     print(f'✅ Bot {bot.user} is ready!')
     print(f'📊 On servers: {len(bot.guilds)}')
     
-    # Запускаем фоновые задачи
     bot.loop.create_task(update_status())
-    bot.loop.create_task(send_monthly_report())
+    bot.loop.create_task(check_long_shifts())
 
 # --- ОСНОВНЫЕ КОМАНДЫ ---
 @bot.tree.command(name='shift', description='📋 Manage your shift')
 async def shift_panel_command(interaction: discord.Interaction):
     await create_shift_panel(interaction, edit=False)
 
-@bot.tree.command(name='onshift', description='👥 Who is on shift right now (with time)')
+@bot.tree.command(name='onshift', description='👥 Who is on shift right now')
 async def on_shift(interaction: discord.Interaction):
     try:
         active_users = await get_active_shifts(interaction.guild_id)
@@ -447,7 +564,6 @@ async def my_stats(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
 
-# --- НОВАЯ КОМАНДА: СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ ---
 @bot.tree.command(name='user-stats', description='📊 Statistics of a specific employee')
 async def user_stats(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.defer(ephemeral=True)
@@ -528,7 +644,6 @@ async def user_stats(interaction: discord.Interaction, user: discord.Member):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-# --- НОВАЯ КОМАНДА: ТОП СОТРУДНИКОВ ---
 @bot.tree.command(name='top', description='🏆 Top employees by hours worked')
 async def top_employees(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -580,12 +695,8 @@ async def top_employees(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-# --- КОМАНДА ДЛЯ ТЕСТОВОГО ОТЧЁТА ---
 @bot.tree.command(name='test-report', description='🧪 Test monthly report (admin only)')
 async def test_report(interaction: discord.Interaction):
-    """Отправляет тестовый отчёт за текущий месяц (только для админов)"""
-    
-    # Проверка прав администратора
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ You don't have permission! Admin only.", ephemeral=True)
         return
@@ -594,12 +705,9 @@ async def test_report(interaction: discord.Interaction):
     
     try:
         now = datetime.now()
-        
-        # Берём данные за текущий месяц
         month_start = now.replace(day=1, hour=0, minute=0, second=0)
         month_end = now
         
-        # Получаем статистику за месяц
         async with aiosqlite.connect('shifts.db') as db:
             cursor = await db.execute('''
                 SELECT 
@@ -618,7 +726,6 @@ async def test_report(interaction: discord.Interaction):
             ''', (month_start.isoformat(), month_end.isoformat()))
             stats = await cursor.fetchall()
         
-        # Создаём embed с отчётом
         embed = discord.Embed(
             title=f"📊 Test Report - {month_start.strftime('%B %Y')}",
             color=discord.Color.gold(),
@@ -658,7 +765,6 @@ async def test_report(interaction: discord.Interaction):
         
         embed.set_footer(text="Test report (no data deleted)")
         
-        # Отправляем отчёт
         await interaction.followup.send(embed=embed)
         print(f"✅ Test report sent to {interaction.user.name}")
         
@@ -688,6 +794,14 @@ async def on_interaction(interaction: discord.Interaction):
                     color=discord.Color.green()
                 )
                 await interaction.followup.send(embed=embed, ephemeral=True)
+                
+                # Отправляем уведомление в канал
+                await send_shift_start_notification(
+                    interaction.user.id,
+                    interaction.user.name,
+                    interaction.guild_id
+                )
+                
                 await asyncio.sleep(2)
                 await create_shift_panel(interaction, edit=True)
             else:
@@ -703,6 +817,15 @@ async def on_interaction(interaction: discord.Interaction):
                     color=discord.Color.red()
                 )
                 await interaction.followup.send(embed=embed, ephemeral=True)
+                
+                # Отправляем уведомление в канал
+                await send_shift_end_notification(
+                    interaction.user.id,
+                    interaction.user.name,
+                    duration,
+                    interaction.guild_id
+                )
+                
                 await asyncio.sleep(2)
                 await create_shift_panel(interaction, edit=True)
             else:
