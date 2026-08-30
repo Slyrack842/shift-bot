@@ -21,9 +21,14 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- DATABASE ---
+# --- НАСТРОЙКИ ДЛЯ ОТЧЁТОВ ---
+REPORT_CHANNEL_ID = 1533758067513098408   # ID канала для отчётов
+REPORT_USER_ID = 775396551936704533      # ID пользователя для отчётов (ЗАМЕНИТЕ НА СВОЙ!)
+
+# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect('shifts.db') as db:
+        # Таблица смен
         await db.execute('''
             CREATE TABLE IF NOT EXISTS shifts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,6 +38,13 @@ async def init_db():
                 end_time TEXT,
                 guild_id INTEGER,
                 is_active INTEGER DEFAULT 1
+            )
+        ''')
+        # Таблица для хранения даты последней очистки
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
         ''')
         await db.commit()
@@ -80,7 +92,136 @@ async def end_shift(user_id, guild_id):
         hours = duration.total_seconds() / 3600
         return f"{int(hours)}h {int((hours % 1) * 60)}min"
 
-# --- STATUS UPDATE ---
+# --- ФУНКЦИЯ ДЛЯ ФОРМАТИРОВАНИЯ ВРЕМЕНИ ---
+def format_time(seconds):
+    if seconds is None or seconds == 0:
+        return "0h 0min"
+    hours = int(seconds / 3600)
+    minutes = int((seconds % 3600) / 60)
+    if hours == 0:
+        return f"{minutes} min"
+    if minutes == 0:
+        return f"{hours} h"
+    return f"{hours} h {minutes} min"
+
+# --- ФУНКЦИЯ ДЛЯ ОТПРАВКИ ОТЧЁТА ---
+async def send_monthly_report():
+    """Отправляет отчёт за месяц в указанный канал"""
+    await bot.wait_until_ready()
+    
+    # Ждём, пока бот полностью запустится
+    await asyncio.sleep(10)
+    
+    while not bot.is_closed():
+        try:
+            now = datetime.now()
+            
+            # Проверяем, не наступил ли конец месяца (последний день, 23:50)
+            # Или первый день нового месяца (для отчёта за прошлый месяц)
+            is_last_day = now.day == 1 and now.hour == 0 and now.minute < 5
+            
+            if is_last_day:
+                # Берём данные за прошлый месяц
+                month_start = (now - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0)
+                month_end = now.replace(day=1, hour=0, minute=0, second=0)
+                
+                # Получаем статистику за месяц
+                async with aiosqlite.connect('shifts.db') as db:
+                    cursor = await db.execute('''
+                        SELECT 
+                            user_id,
+                            username,
+                            COUNT(*) as shift_count,
+                            SUM(strftime('%s', end_time) - strftime('%s', start_time)) as total_seconds
+                        FROM shifts 
+                        WHERE guild_id IS NOT NULL 
+                        AND is_active = 0 
+                        AND end_time IS NOT NULL
+                        AND start_time >= ?
+                        AND end_time <= ?
+                        GROUP BY user_id, username
+                        ORDER BY total_seconds DESC
+                    ''', (month_start.isoformat(), month_end.isoformat()))
+                    stats = await cursor.fetchall()
+                    
+                    # Удаляем старые смены (очистка)
+                    await db.execute(
+                        'DELETE FROM shifts WHERE end_time < ? AND is_active = 0',
+                        (month_end.isoformat(),)
+                    )
+                    await db.commit()
+                
+                # Создаём embed с отчётом
+                embed = discord.Embed(
+                    title=f"📊 Monthly Report - {month_start.strftime('%B %Y')}",
+                    color=discord.Color.gold(),
+                    timestamp=datetime.now()
+                )
+                
+                if stats:
+                    total_employees = len(stats)
+                    total_shifts = sum(s[2] for s in stats)
+                    total_seconds = sum(s[3] for s in stats if s[3])
+                    
+                    embed.add_field(
+                        name="📈 Summary",
+                        value=f"Employees: {total_employees}\nTotal Shifts: {total_shifts}\nTotal Hours: {format_time(total_seconds)}",
+                        inline=False
+                    )
+                    
+                    # Топ-10 сотрудников
+                    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+                    top_list = []
+                    for i, (user_id, username, shifts, seconds) in enumerate(stats[:10], 1):
+                        # Пробуем получить актуальный никнейм
+                        try:
+                            guild = bot.get_guild(1478824197357703281)  # ID вашего сервера
+                            member = guild.get_member(user_id) if guild else None
+                            display_name = member.display_name if member else username
+                        except:
+                            display_name = username
+                        
+                        top_list.append(f"{medals[i-1]} **{display_name}**\n   └ {shifts} shifts, {format_time(seconds)}")
+                    
+                    embed.add_field(
+                        name="🏆 Top 10 Employees",
+                        value="\n\n".join(top_list),
+                        inline=False
+                    )
+                else:
+                    embed.description = "📭 No shifts recorded this month"
+                
+                embed.set_footer(text="Monthly cleanup completed")
+                
+                # Отправляем отчёт в канал
+                try:
+                    # Отправляем в указанный канал
+                    if REPORT_CHANNEL_ID:
+                        channel = bot.get_channel(REPORT_CHANNEL_ID)
+                        if channel:
+                            await channel.send(embed=embed)
+                    
+                    # Отправляем в личные сообщения (если указан ID пользователя)
+                    if REPORT_USER_ID:
+                        user = await bot.fetch_user(REPORT_USER_ID)
+                        if user:
+                            await user.send(embed=embed)
+                except Exception as e:
+                    print(f"❌ Error sending report: {e}")
+                
+                print(f"✅ Monthly report sent and old shifts deleted")
+                
+                # Ждём сутки, чтобы не отправлять отчёт повторно
+                await asyncio.sleep(86400)
+            
+            # Проверяем каждый час
+            await asyncio.sleep(3600)
+            
+        except Exception as e:
+            print(f"❌ Error in monthly report: {e}")
+            await asyncio.sleep(3600)
+
+# --- ОБНОВЛЕНИЕ СТАТУСА ---
 async def update_status():
     await bot.wait_until_ready()
     while not bot.is_closed():
@@ -98,7 +239,7 @@ async def update_status():
             pass
         await asyncio.sleep(30)
 
-# --- CREATE SHIFT PANEL ---
+# --- СОЗДАНИЕ ПАНЕЛИ ---
 async def create_shift_panel(interaction: discord.Interaction, edit: bool = False):
     try:
         async with aiosqlite.connect('shifts.db') as db:
@@ -160,7 +301,7 @@ async def create_shift_panel(interaction: discord.Interaction, edit: bool = Fals
         if not edit:
             await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
 
-# --- BUTTONS ---
+# --- КНОПКИ ---
 class ShiftButtons(discord.ui.View):
     def __init__(self, is_active, user_id):
         super().__init__(timeout=120)
@@ -191,7 +332,7 @@ class ShiftButtons(discord.ui.View):
             return False
         return True
 
-# --- COMMANDS ---
+# --- КОМАНДЫ ---
 @bot.event
 async def on_ready():
     await init_db()
@@ -204,18 +345,18 @@ async def on_ready():
         print(f'❌ Sync error: {e}')
     print(f'✅ Bot {bot.user} is ready!')
     print(f'📊 On servers: {len(bot.guilds)}')
+    
+    # Запускаем фоновые задачи
     bot.loop.create_task(update_status())
+    bot.loop.create_task(send_monthly_report())
 
-# --- MAIN COMMANDS ---
+# --- ОСНОВНЫЕ КОМАНДЫ ---
 @bot.tree.command(name='shift', description='📋 Manage your shift')
 async def shift_panel_command(interaction: discord.Interaction):
     await create_shift_panel(interaction, edit=False)
 
-# --- UPDATED /ONSHIFT COMMAND WITH TIME ---
 @bot.tree.command(name='onshift', description='👥 Who is on shift right now (with time)')
 async def on_shift(interaction: discord.Interaction):
-    """Shows everyone on shift with their time"""
-    
     try:
         active_users = await get_active_shifts(interaction.guild_id)
         
@@ -247,7 +388,6 @@ async def on_shift(interaction: discord.Interaction):
             
             embed.description = "\n".join(user_list)
             
-            # Total stats
             total_hours = int(total_seconds / 3600)
             total_minutes = int((total_seconds % 3600) / 60)
             embed.set_footer(text=f"Total: {len(active_users)} people | Total time: {total_hours}h {total_minutes}min")
@@ -258,7 +398,6 @@ async def on_shift(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
 
-# --- MY STATS COMMAND ---
 @bot.tree.command(name='stats', description='📊 My shift statistics')
 async def my_stats(interaction: discord.Interaction):
     try:
@@ -308,16 +447,13 @@ async def my_stats(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
 
-# --- NEW COMMAND: USER STATS ---
+# --- НОВАЯ КОМАНДА: СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ ---
 @bot.tree.command(name='user-stats', description='📊 Statistics of a specific employee')
 async def user_stats(interaction: discord.Interaction, user: discord.Member):
-    """Shows statistics of the selected user"""
-    
     await interaction.response.defer(ephemeral=True)
     
     try:
         async with aiosqlite.connect('shifts.db') as db:
-            # Get all completed shifts of the user
             cursor = await db.execute('''
                 SELECT start_time, end_time FROM shifts 
                 WHERE user_id = ? AND guild_id = ? AND is_active = 0
@@ -329,7 +465,6 @@ async def user_stats(interaction: discord.Interaction, user: discord.Member):
                 await interaction.followup.send(f"📭 User {user.mention} has no completed shifts.", ephemeral=True)
                 return
             
-            # Calculate statistics
             total_seconds = 0
             today_seconds = 0
             week_seconds = 0
@@ -352,18 +487,6 @@ async def user_stats(interaction: discord.Interaction, user: discord.Member):
                     week_seconds += duration
                 if start >= month_ago:
                     month_seconds += duration
-            
-            # Format time
-            def format_time(seconds):
-                if seconds < 60:
-                    return f"{int(seconds)} sec"
-                hours = int(seconds / 3600)
-                minutes = int((seconds % 3600) / 60)
-                if hours == 0:
-                    return f"{minutes} min"
-                if minutes == 0:
-                    return f"{hours} h"
-                return f"{hours} h {minutes} min"
             
             embed = discord.Embed(
                 title=f"📊 Statistics for {user.display_name}",
@@ -405,11 +528,9 @@ async def user_stats(interaction: discord.Interaction, user: discord.Member):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-# --- NEW COMMAND: TOP EMPLOYEES ---
+# --- НОВАЯ КОМАНДА: ТОП СОТРУДНИКОВ ---
 @bot.tree.command(name='top', description='🏆 Top employees by hours worked')
 async def top_employees(interaction: discord.Interaction):
-    """Shows top 10 employees by total hours worked"""
-    
     await interaction.response.defer(ephemeral=True)
     
     try:
@@ -432,17 +553,6 @@ async def top_employees(interaction: discord.Interaction):
                 await interaction.followup.send("📭 No shift data available.", ephemeral=True)
                 return
             
-            def format_time(seconds):
-                if seconds is None or seconds == 0:
-                    return "0 h"
-                hours = int(seconds / 3600)
-                minutes = int((seconds % 3600) / 60)
-                if hours == 0:
-                    return f"{minutes} min"
-                if minutes == 0:
-                    return f"{hours} h"
-                return f"{hours} h {minutes} min"
-            
             embed = discord.Embed(
                 title="🏆 Top Employees by Hours Worked",
                 color=discord.Color.gold(),
@@ -452,7 +562,6 @@ async def top_employees(interaction: discord.Interaction):
             medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
             
             for i, (user_id, username, shifts, seconds) in enumerate(stats):
-                # Try to get nickname if user is on the server
                 try:
                     member = interaction.guild.get_member(user_id)
                     display_name = member.display_name if member else username
@@ -471,7 +580,92 @@ async def top_employees(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-# --- BUTTON HANDLERS ---
+# --- КОМАНДА ДЛЯ ТЕСТОВОГО ОТЧЁТА ---
+@bot.tree.command(name='test-report', description='🧪 Test monthly report (admin only)')
+async def test_report(interaction: discord.Interaction):
+    """Отправляет тестовый отчёт за текущий месяц (только для админов)"""
+    
+    # Проверка прав администратора
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You don't have permission! Admin only.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        now = datetime.now()
+        
+        # Берём данные за текущий месяц
+        month_start = now.replace(day=1, hour=0, minute=0, second=0)
+        month_end = now
+        
+        # Получаем статистику за месяц
+        async with aiosqlite.connect('shifts.db') as db:
+            cursor = await db.execute('''
+                SELECT 
+                    user_id,
+                    username,
+                    COUNT(*) as shift_count,
+                    SUM(strftime('%s', end_time) - strftime('%s', start_time)) as total_seconds
+                FROM shifts 
+                WHERE guild_id IS NOT NULL 
+                AND is_active = 0 
+                AND end_time IS NOT NULL
+                AND start_time >= ?
+                AND end_time <= ?
+                GROUP BY user_id, username
+                ORDER BY total_seconds DESC
+            ''', (month_start.isoformat(), month_end.isoformat()))
+            stats = await cursor.fetchall()
+        
+        # Создаём embed с отчётом
+        embed = discord.Embed(
+            title=f"📊 Test Report - {month_start.strftime('%B %Y')}",
+            color=discord.Color.gold(),
+            timestamp=datetime.now()
+        )
+        
+        if stats:
+            total_employees = len(stats)
+            total_shifts = sum(s[2] for s in stats)
+            total_seconds = sum(s[3] for s in stats if s[3])
+            
+            embed.add_field(
+                name="📈 Summary",
+                value=f"Employees: {total_employees}\nTotal Shifts: {total_shifts}\nTotal Hours: {format_time(total_seconds)}",
+                inline=False
+            )
+            
+            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+            top_list = []
+            for i, (user_id, username, shifts, seconds) in enumerate(stats[:10], 1):
+                try:
+                    guild = bot.get_guild(interaction.guild_id)
+                    member = guild.get_member(user_id) if guild else None
+                    display_name = member.display_name if member else username
+                except:
+                    display_name = username
+                
+                top_list.append(f"{medals[i-1]} **{display_name}**\n   └ {shifts} shifts, {format_time(seconds)}")
+            
+            embed.add_field(
+                name="🏆 Top 10 Employees",
+                value="\n\n".join(top_list),
+                inline=False
+            )
+        else:
+            embed.description = "📭 No shifts recorded this month"
+        
+        embed.set_footer(text="Test report (no data deleted)")
+        
+        # Отправляем отчёт
+        await interaction.followup.send(embed=embed)
+        print(f"✅ Test report sent to {interaction.user.name}")
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+
+# --- ОБРАБОТЧИКИ КНОПОК ---
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     if interaction.type != discord.InteractionType.component:
@@ -527,7 +721,7 @@ async def on_interaction(interaction: discord.Interaction):
         except:
             pass
 
-# --- LAUNCH ---
+# --- ЗАПУСК ---
 if __name__ == '__main__':
     try:
         bot.run(TOKEN)
