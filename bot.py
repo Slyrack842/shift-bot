@@ -19,7 +19,16 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+# ✅ БОТ СО СТАТУСОМ "В СЕТИ"
+bot = commands.Bot(
+    command_prefix='!',
+    intents=intents,
+    activity=discord.Activity(
+        type=discord.ActivityType.watching,
+        name="0 people on shift"
+    ),
+    status=discord.Status.online
+)
 
 # --- SETTINGS ---
 REPORT_CHANNEL_ID = 1533758067513098408
@@ -30,21 +39,18 @@ REMINDER_HOURS = 4
 URGENT_HOURS = 8
 CHECK_INTERVAL = 30
 
-# --- УВЕДОМЛЕНИЯ О СЛОТАХ ---
 NOTIFICATION_TIME_HOUR = 9
 NOTIFICATION_TIME_MINUTE = 0
 
 TOMORROW_NOTIFICATION_HOUR = 12
 TOMORROW_NOTIFICATION_MINUTE = 0
 
-# --- AUTO-PUBLISH ---
 AUTO_PUBLISH_ENABLED = True
 AUTO_PUBLISH_DAY = 6
 AUTO_PUBLISH_HOUR = 20
 AUTO_PUBLISH_MINUTE = 0
 AUTO_PUBLISH_PING_ROLE_ID = 1533758065323540565
 
-# --- РОЛИ С АДМИН-ДОСТУПОМ ---
 ADMIN_ROLE_IDS = [
     1533758065352900822,
 ]
@@ -590,8 +596,12 @@ async def update_status():
             total = 0
             for guild in bot.guilds:
                 total += len(await get_active_shifts(guild.id))
-            await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=f"{total} people on shift"))
-        except: pass
+            await bot.change_presence(
+                status=discord.Status.online,  # ✅ ВСЕГДА "В СЕТИ"
+                activity=discord.Activity(type=discord.ActivityType.watching, name=f"{total} people on shift")
+            )
+        except Exception as e:
+            print(f"❌ Status update error: {e}")
         await asyncio.sleep(30)
 
 # --- MONTHLY REPORT ---
@@ -720,6 +730,11 @@ class ShiftPanelView(discord.ui.View):
 @bot.event
 async def on_ready():
     await init_db()
+    # ✅ Устанавливаем статус "В СЕТИ"
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=discord.Activity(type=discord.ActivityType.watching, name="0 people on shift")
+    )
     try:
         synced = await bot.tree.sync()
         print(f'✅ Synced {len(synced)} commands')
@@ -1133,16 +1148,39 @@ async def test_rep(interaction: discord.Interaction):
         embed.description = "📭 No shifts this month"
     await interaction.followup.send(embed=embed)
 
-# ==================== FORCE END SHIFTS (ADMIN) ====================
-@bot.tree.command(name='force-end-shift', description='🔧 Принудительно завершить смену сотрудника (админ)')
-async def force_end_shift(interaction: discord.Interaction, user: discord.Member):
-    if not is_admin(interaction):
-        await interaction.response.send_message("❌ Нет доступа!", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
-    async with aiosqlite.connect('shifts.db') as db:
-        cursor = await db.execute(
-            'SELECT id, start_time FROM shifts WHERE user_id = ? AND guild_id = ? AND is_active = 1',
-            (user.id, interaction.guild_id))
-        shift = await cursor.fetchone()
-        if not shift:
-            await interaction.followup.send(f"❌ У {user.mention} нет активной смены.", ephemeral=True)
+# --- BUTTON HANDLERS ---
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.component: return
+    cid = interaction.data.get('custom_id')
+    if not cid: return
+    try:
+        if cid == 'start_shift_button':
+            if await start_shift(interaction.user.id, interaction.user.name, interaction.guild_id):
+                await interaction.response.defer()
+                await interaction.followup.send("✅ Shift started!", ephemeral=True)
+                await send_shift_start_notification(interaction.user.id, interaction.user.name, interaction.guild_id)
+                await asyncio.sleep(1)
+                await create_shift_panel(interaction, edit=True)
+            else:
+                await interaction.response.send_message("❌ Already on shift!", ephemeral=True)
+        elif cid == 'end_shift_button':
+            duration = await end_shift(interaction.user.id, interaction.guild_id)
+            if duration:
+                await interaction.response.defer()
+                await interaction.followup.send(f"✅ Shift ended! **{duration}**", ephemeral=True)
+                await send_shift_end_notification(interaction.user.id, interaction.user.name, duration, interaction.guild_id)
+                await asyncio.sleep(1)
+                await create_shift_panel(interaction, edit=True)
+            else:
+                await interaction.response.send_message("❌ No active shift!", ephemeral=True)
+        elif cid == 'refresh_button':
+            await interaction.response.defer()
+            await create_shift_panel(interaction, edit=True)
+    except discord.errors.InteractionResponded: pass
+    except Exception as e: print(f"❌ on_interaction error: {e}")
+
+# --- LAUNCH ---
+if __name__ == '__main__':
+    try: bot.run(TOKEN)
+    except Exception as e: print(f"❌ Launch error: {e}")
