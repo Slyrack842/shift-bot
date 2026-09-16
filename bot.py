@@ -19,7 +19,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-# ✅ БОТ СО СТАТУСОМ "В СЕТИ"
 bot = commands.Bot(
     command_prefix='!',
     intents=intents,
@@ -597,7 +596,7 @@ async def update_status():
             for guild in bot.guilds:
                 total += len(await get_active_shifts(guild.id))
             await bot.change_presence(
-                status=discord.Status.online,  # ✅ ВСЕГДА "В СЕТИ"
+                status=discord.Status.online,
                 activity=discord.Activity(type=discord.ActivityType.watching, name=f"{total} people on shift")
             )
         except Exception as e:
@@ -730,7 +729,6 @@ class ShiftPanelView(discord.ui.View):
 @bot.event
 async def on_ready():
     await init_db()
-    # ✅ Устанавливаем статус "В СЕТИ"
     await bot.change_presence(
         status=discord.Status.online,
         activity=discord.Activity(type=discord.ActivityType.watching, name="0 people on shift")
@@ -1147,6 +1145,136 @@ async def test_rep(interaction: discord.Interaction):
     else:
         embed.description = "📭 No shifts this month"
     await interaction.followup.send(embed=embed)
+
+# ==================== FORCE END SHIFTS (ADMIN) ====================
+@bot.tree.command(name='force-end-shift', description='🔧 Принудительно завершить смену сотрудника (админ)')
+async def force_end_shift(interaction: discord.Interaction, user: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Нет доступа!", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    async with aiosqlite.connect('shifts.db') as db:
+        cursor = await db.execute(
+            'SELECT id, start_time FROM shifts WHERE user_id = ? AND guild_id = ? AND is_active = 1',
+            (user.id, interaction.guild_id))
+        shift = await cursor.fetchone()
+        if not shift:
+            await interaction.followup.send(f"❌ У {user.mention} нет активной смены.", ephemeral=True)
+            return
+        shift_id, start_time = shift
+        now = datetime.now()
+        duration = now - datetime.fromisoformat(start_time)
+        duration_str = f"{int(duration.total_seconds()/3600)}h {int((duration.total_seconds()%3600)/60)}min"
+        await db.execute(
+            'UPDATE shifts SET end_time = ?, is_active = 0 WHERE id = ?',
+            (now.isoformat(), shift_id))
+        await db.commit()
+    try:
+        channel = bot.get_channel(REPORT_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title="🔴 Shift Force Ended",
+                description=f"**{user.name}**'s shift was ended by {interaction.user.mention}",
+                color=discord.Color.dark_red(), timestamp=datetime.now())
+            embed.add_field(name="⏱️ Duration", value=duration_str, inline=True)
+            embed.add_field(name="👮 Ended by", value=interaction.user.name, inline=True)
+            await channel.send(embed=embed)
+    except Exception as e:
+        print(f"❌ Notification error: {e}")
+    try:
+        embed_dm = discord.Embed(
+            title="🔴 Your shift was ended",
+            description=f"Ваша смена была завершена администратором {interaction.user.name}.",
+            color=discord.Color.red(), timestamp=datetime.now())
+        embed_dm.add_field(name="⏱️ Duration", value=duration_str, inline=True)
+        await user.send(embed=embed_dm)
+    except discord.Forbidden:
+        pass
+    except Exception as e:
+        print(f"❌ DM error: {e}")
+    embed = discord.Embed(
+        title="✅ Shift Ended",
+        description=f"Смена {user.mention} завершена.\n**Длительность:** {duration_str}",
+        color=discord.Color.green(), timestamp=datetime.now())
+    embed.set_footer(text=f"Ended by: {interaction.user.name}")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name='force-end-all', description='🔧 Завершить ВСЕ активные смены на сервере (админ)')
+async def force_end_all(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Нет доступа!", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    async with aiosqlite.connect('shifts.db') as db:
+        cursor = await db.execute(
+            'SELECT id, user_id, username, start_time FROM shifts WHERE guild_id = ? AND is_active = 1',
+            (interaction.guild_id,))
+        shifts = await cursor.fetchall()
+        if not shifts:
+            await interaction.followup.send("📭 Нет активных смен.", ephemeral=True)
+            return
+        now = datetime.now()
+        ended_users = []
+        for shift_id, user_id, username, start_time in shifts:
+            duration = now - datetime.fromisoformat(start_time)
+            duration_str = f"{int(duration.total_seconds()/3600)}h {int((duration.total_seconds()%3600)/60)}min"
+            await db.execute(
+                'UPDATE shifts SET end_time = ?, is_active = 0 WHERE id = ?',
+                (now.isoformat(), shift_id))
+            ended_users.append((user_id, username, duration_str))
+        await db.commit()
+    try:
+        channel = bot.get_channel(REPORT_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title="🔴 All Shifts Force Ended",
+                description=f"Завершено **{len(ended_users)}** смен администратором {interaction.user.mention}",
+                color=discord.Color.dark_red(), timestamp=datetime.now())
+            user_list = []
+            for uid, uname, dur in ended_users[:15]:
+                user_list.append(f"👤 {uname} — {dur}")
+            if len(ended_users) > 15:
+                user_list.append(f"... и ещё {len(ended_users) - 15}")
+            embed.add_field(name="👥 Ended shifts", value="\n".join(user_list), inline=False)
+            await channel.send(embed=embed)
+    except Exception as e:
+        print(f"❌ Notification error: {e}")
+    embed = discord.Embed(
+        title="✅ All Shifts Ended",
+        description=f"Завершено **{len(ended_users)}** смен.",
+        color=discord.Color.green(), timestamp=datetime.now())
+    embed.set_footer(text=f"Ended by: {interaction.user.name}")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name='force-end-shift-id', description='🔧 Завершить смену по ID (админ)')
+async def force_end_shift_id(interaction: discord.Interaction, shift_id: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Нет доступа!", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    async with aiosqlite.connect('shifts.db') as db:
+        cursor = await db.execute(
+            'SELECT id, user_id, username, start_time, is_active FROM shifts WHERE id = ? AND guild_id = ?',
+            (shift_id, interaction.guild_id))
+        shift = await cursor.fetchone()
+        if not shift:
+            await interaction.followup.send(f"❌ Смена `{shift_id}` не найдена.", ephemeral=True)
+            return
+        sid, user_id, username, start_time, is_active = shift
+        if not is_active:
+            await interaction.followup.send(f"⚠️ Смена `{shift_id}` уже завершена.", ephemeral=True)
+            return
+        now = datetime.now()
+        duration = now - datetime.fromisoformat(start_time)
+        duration_str = f"{int(duration.total_seconds()/3600)}h {int((duration.total_seconds()%3600)/60)}min"
+        await db.execute(
+            'UPDATE shifts SET end_time = ?, is_active = 0 WHERE id = ?',
+            (now.isoformat(), shift_id))
+        await db.commit()
+    await interaction.followup.send(
+        f"✅ Смена `{shift_id}` завершена.\n"
+        f"👤 Пользователь: <@{user_id}>\n"
+        f"⏱️ Длительность: {duration_str}",
+        ephemeral=True)
 
 # --- BUTTON HANDLERS ---
 @bot.event
