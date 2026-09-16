@@ -1145,4 +1145,4 @@ async def force_end_shift(interaction: discord.Interaction, user: discord.Member
             (user.id, interaction.guild_id))
         shift = await cursor.fetchone()
         if not shift:
-            await interaction.followup.send(f"❌ У {user.mention
+            await interaction.followup.send(f"❌ У {user.mention} нет активной смены.", ephemeral=True)
