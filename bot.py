@@ -54,16 +54,13 @@ ADMIN_ROLE_IDS = [
     1533758065352900822,
 ]
 
-# ✅ ТОЛЬКО ЗА 15 МИНУТ
 SLOT_REMINDERS = [15]
 DEFAULT_MAX_PEOPLE = 3
 
-# --- TIMEZONE (GMT+3 Moscow) ---
-TIMEZONE_OFFSET = 3
-
+# --- TIMEZONE: UTC (server time) ---
 def now_tz():
-    """Текущее время по GMT+3"""
-    return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
+    """Текущее время (UTC / время сервера)"""
+    return datetime.now()
 
 # --- DATABASE ---
 async def init_db():
