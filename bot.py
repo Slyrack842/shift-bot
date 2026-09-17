@@ -54,8 +54,16 @@ ADMIN_ROLE_IDS = [
     1533758065352900822,
 ]
 
-SLOT_REMINDERS = [60, 30, 15]
+# ✅ ТОЛЬКО ЗА 15 МИНУТ
+SLOT_REMINDERS = [15]
 DEFAULT_MAX_PEOPLE = 3
+
+# --- TIMEZONE (GMT+3 Moscow) ---
+TIMEZONE_OFFSET = 3
+
+def now_tz():
+    """Текущее время по GMT+3"""
+    return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
 
 # --- DATABASE ---
 async def init_db():
@@ -152,7 +160,7 @@ async def start_shift(user_id, username, guild_id):
         cursor = await db.execute('SELECT id FROM shifts WHERE user_id = ? AND guild_id = ? AND is_active = 1', (user_id, guild_id))
         if await cursor.fetchone(): return False
         await db.execute('INSERT INTO shifts (user_id, username, start_time, guild_id, is_active, last_reminder) VALUES (?, ?, ?, ?, 1, 0)',
-                         (user_id, username, datetime.now().isoformat(), guild_id))
+                         (user_id, username, now_tz().isoformat(), guild_id))
         await db.commit()
         return True
 
@@ -161,7 +169,7 @@ async def end_shift(user_id, guild_id):
         cursor = await db.execute('SELECT id, start_time FROM shifts WHERE user_id = ? AND guild_id = ? AND is_active = 1', (user_id, guild_id))
         shift = await cursor.fetchone()
         if not shift: return None
-        now = datetime.now()
+        now = now_tz()
         duration = now - datetime.fromisoformat(shift[1])
         await db.execute('UPDATE shifts SET end_time = ?, is_active = 0 WHERE id = ?', (now.isoformat(), shift[0]))
         await db.commit()
@@ -170,7 +178,7 @@ async def end_shift(user_id, guild_id):
 
 # --- SLOT FUNCTIONS ---
 async def get_today_slots(guild_id):
-    today = datetime.now().weekday()
+    today = now_tz().weekday()
     async with aiosqlite.connect('shifts.db') as db:
         cursor = await db.execute('''
             SELECT s.id, s.start_time, s.end_time, s.max_people,
@@ -182,7 +190,7 @@ async def get_today_slots(guild_id):
         return await cursor.fetchall()
 
 async def get_tomorrow_slots(guild_id):
-    tomorrow = (datetime.now().weekday() + 1) % 7
+    tomorrow = (now_tz().weekday() + 1) % 7
     async with aiosqlite.connect('shifts.db') as db:
         cursor = await db.execute('''
             SELECT s.id, s.start_time, s.end_time, s.max_people,
@@ -228,7 +236,7 @@ async def book_slot(slot_id, user_id, username):
         cursor = await db.execute('SELECT id FROM bookings WHERE slot_id = ? AND user_id = ? AND status = \'booked\'', (slot_id, user_id))
         if await cursor.fetchone(): return "already_booked"
         await db.execute('INSERT INTO bookings (slot_id, user_id, username, booked_at, status) VALUES (?, ?, ?, ?, "booked")',
-                         (slot_id, user_id, username, datetime.now().isoformat()))
+                         (slot_id, user_id, username, now_tz().isoformat()))
         await db.commit()
         return "success"
 
@@ -239,17 +247,19 @@ async def cancel_booking(booking_id, user_id):
         return cursor.rowcount > 0
 
 # --- NOTIFICATION MESSAGES ---
-async def save_notification_message(guild_id, channel_id, message_id):
-    today = datetime.now().date().isoformat()
+async def save_notification_message(guild_id, channel_id, message_id, is_tomorrow=False):
+    today = now_tz().date().isoformat()
+    key = f"tomorrow_{today}" if is_tomorrow else f"today_{today}"
     async with aiosqlite.connect('shifts.db') as db:
         await db.execute('INSERT OR REPLACE INTO notification_messages (guild_id, channel_id, message_id, date) VALUES (?, ?, ?, ?)',
-                         (guild_id, channel_id, message_id, today))
+                         (guild_id, channel_id, message_id, key))
         await db.commit()
 
-async def get_notification_message(guild_id):
-    today = datetime.now().date().isoformat()
+async def get_notification_message(guild_id, is_tomorrow=False):
+    today = now_tz().date().isoformat()
+    key = f"tomorrow_{today}" if is_tomorrow else f"today_{today}"
     async with aiosqlite.connect('shifts.db') as db:
-        cursor = await db.execute('SELECT channel_id, message_id FROM notification_messages WHERE guild_id = ? AND date = ?', (guild_id, today))
+        cursor = await db.execute('SELECT channel_id, message_id FROM notification_messages WHERE guild_id = ? AND date = ?', (guild_id, key))
         return await cursor.fetchone()
 
 # --- NOTIFICATIONS ---
@@ -257,8 +267,8 @@ async def send_shift_start_notification(user_id, username, guild_id):
     try:
         channel = bot.get_channel(REPORT_CHANNEL_ID)
         if channel:
-            embed = discord.Embed(title="🟢 Shift Started", description=f"**{username}** started their shift at {datetime.now().strftime('%H:%M')}",
-                                  color=discord.Color.green(), timestamp=datetime.now())
+            embed = discord.Embed(title="🟢 Shift Started", description=f"**{username}** started their shift at {now_tz().strftime('%H:%M')}",
+                                  color=discord.Color.green(), timestamp=now_tz())
             embed.set_footer(text=f"User ID: {user_id}")
             await channel.send(embed=embed)
     except Exception as e: print(f"❌ Start notification error: {e}")
@@ -268,7 +278,7 @@ async def send_shift_end_notification(user_id, username, duration, guild_id):
         channel = bot.get_channel(REPORT_CHANNEL_ID)
         if channel:
             embed = discord.Embed(title="🔴 Shift Ended", description=f"**{username}** ended their shift",
-                                  color=discord.Color.red(), timestamp=datetime.now())
+                                  color=discord.Color.red(), timestamp=now_tz())
             embed.add_field(name="⏱️ Duration", value=duration, inline=True)
             embed.set_footer(text=f"User ID: {user_id}")
             await channel.send(embed=embed)
@@ -280,7 +290,7 @@ async def check_long_shifts():
     while not bot.is_closed():
         try:
             for user_id, username, start_time_str, guild_id, shift_id in await get_all_active_shifts():
-                hours = (datetime.now() - datetime.fromisoformat(start_time_str)).total_seconds() / 3600
+                hours = (now_tz() - datetime.fromisoformat(start_time_str)).total_seconds() / 3600
                 async with aiosqlite.connect('shifts.db') as db:
                     cursor = await db.execute('SELECT last_reminder FROM shifts WHERE id = ?', (shift_id,))
                     result = await cursor.fetchone()
@@ -294,11 +304,11 @@ async def check_long_shifts():
                         if user:
                             if rtype == "normal":
                                 embed = discord.Embed(title="⏰ Shift Reminder", description=f"⚠️ You've been on shift for **{int(hours)} hours**!",
-                                                      color=discord.Color.orange(), timestamp=datetime.now())
+                                                      color=discord.Color.orange(), timestamp=now_tz())
                                 embed.add_field(name="💡 Tip", value="Don't forget to take breaks!", inline=False)
                             else:
                                 embed = discord.Embed(title="🚨 URGENT: Long Shift Warning", description=f"⚠️ You've been on shift for **{int(hours)} hours**!",
-                                                      color=discord.Color.red(), timestamp=datetime.now())
+                                                      color=discord.Color.red(), timestamp=now_tz())
                                 embed.add_field(name="💡 Important", value="Please consider ending your shift.", inline=False)
                             await user.send(embed=embed)
                             new_val = 2 if rtype == "urgent" else 1
@@ -312,12 +322,12 @@ async def check_long_shifts():
             print(f"❌ check_long_shifts error: {e}")
             await asyncio.sleep(60)
 
-# --- SLOT REMINDERS ---
+# --- SLOT REMINDERS (только за 15 минут) ---
 async def check_slot_reminders():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            now = datetime.now()
+            now = now_tz()
             today = now.weekday()
             async with aiosqlite.connect('shifts.db') as db:
                 cursor = await db.execute('''
@@ -347,7 +357,7 @@ async def check_slot_reminders():
                                     embed = discord.Embed(
                                         title=f"⏰ Shift Reminder — {remind_min} min",
                                         description=f"Your shift starts at **{start}** ({remind_min} minutes left!)",
-                                        color=discord.Color.gold(), timestamp=datetime.now()
+                                        color=discord.Color.gold(), timestamp=now_tz()
                                     )
                                     embed.add_field(name="📅 Slot", value=f"{start} - {end}", inline=False)
                                     await user.send(embed=embed)
@@ -368,7 +378,7 @@ async def build_slot_notification_embed(guild):
     embed = discord.Embed(
         title="📢 Sign Up for Shifts!",
         description="**Available slots for today (00:00 - 23:00):**\nClick the menu below to book your shift!",
-        color=discord.Color.blurple(), timestamp=datetime.now()
+        color=discord.Color.blurple(), timestamp=now_tz()
     )
     if not today_slots:
         embed.description = "📭 No slots available for today. Check back later!"
@@ -387,12 +397,12 @@ async def build_slot_notification_embed(guild):
 # --- BUILD EMBED: TOMORROW ---
 async def build_tomorrow_notification_embed(guild):
     tomorrow_slots = await get_tomorrow_slots(guild.id)
-    tomorrow_day = (datetime.now().weekday() + 1) % 7
+    tomorrow_day = (now_tz().weekday() + 1) % 7
     tomorrow_name = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][tomorrow_day]
     embed = discord.Embed(
         title=f"📢 Sign Up for Tomorrow ({tomorrow_name})!",
         description="**Available slots for tomorrow (00:00 - 23:00):**\nClick the menu below to book your shift in advance!",
-        color=discord.Color.purple(), timestamp=datetime.now()
+        color=discord.Color.purple(), timestamp=now_tz()
     )
     if not tomorrow_slots:
         embed.description = f"📭 No slots available for tomorrow ({tomorrow_name})."
@@ -418,7 +428,7 @@ async def send_slot_notification():
             embed, free_slots = await build_slot_notification_embed(guild)
             view = SlotNotificationView(guild.id, free_slots)
             msg = await channel.send(embed=embed, view=view)
-            await save_notification_message(guild.id, channel.id, msg.id)
+            await save_notification_message(guild.id, channel.id, msg.id, is_tomorrow=False)
             print(f"✅ Today notification sent to {guild.name}")
     except Exception as e: print(f"❌ Error sending today notification: {e}")
 
@@ -429,13 +439,14 @@ async def send_tomorrow_notification():
             if not channel: continue
             embed, free_slots = await build_tomorrow_notification_embed(guild)
             view = SlotNotificationView(guild.id, free_slots)
-            await channel.send(embed=embed, view=view)
+            msg = await channel.send(embed=embed, view=view)
+            await save_notification_message(guild.id, channel.id, msg.id, is_tomorrow=True)
             print(f"✅ Tomorrow notification sent to {guild.name}")
     except Exception as e: print(f"❌ Error sending tomorrow notification: {e}")
 
-async def update_slot_notification(guild_id):
+async def update_tomorrow_notification(guild_id):
     try:
-        msg_data = await get_notification_message(guild_id)
+        msg_data = await get_notification_message(guild_id, is_tomorrow=True)
         if not msg_data: return
         channel_id, message_id = msg_data
         channel = bot.get_channel(channel_id)
@@ -444,10 +455,28 @@ async def update_slot_notification(guild_id):
         except discord.NotFound: return
         guild = bot.get_guild(guild_id)
         if not guild: return
-        embed, free_slots = await build_slot_notification_embed(guild)
+        embed, free_slots = await build_tomorrow_notification_embed(guild)
         view = SlotNotificationView(guild_id, free_slots)
         await message.edit(embed=embed, view=view)
-    except Exception as e: print(f"❌ Error updating notification: {e}")
+    except Exception as e: print(f"❌ Error updating tomorrow notification: {e}")
+
+async def update_slot_notification(guild_id):
+    try:
+        msg_data = await get_notification_message(guild_id, is_tomorrow=False)
+        if msg_data:
+            channel_id, message_id = msg_data
+            channel = bot.get_channel(channel_id)
+            if channel:
+                try: message = await channel.fetch_message(message_id)
+                except discord.NotFound: message = None
+                if message:
+                    guild = bot.get_guild(guild_id)
+                    if guild:
+                        embed, free_slots = await build_slot_notification_embed(guild)
+                        view = SlotNotificationView(guild_id, free_slots)
+                        await message.edit(embed=embed, view=view)
+        await update_tomorrow_notification(guild_id)
+    except Exception as e: print(f"❌ Error updating notifications: {e}")
 
 # --- NOTIFICATION LOOP ---
 async def slot_notification_loop():
@@ -455,7 +484,7 @@ async def slot_notification_loop():
     await asyncio.sleep(30)
     while not bot.is_closed():
         try:
-            now = datetime.now()
+            now = now_tz()
             today_key = now.date().isoformat()
             if now.hour == NOTIFICATION_TIME_HOUR and now.minute < 5:
                 key = f"daily_notification_{today_key}"
@@ -494,7 +523,7 @@ async def auto_publish_next_week():
         try:
             if not AUTO_PUBLISH_ENABLED:
                 await asyncio.sleep(3600); continue
-            now = datetime.now()
+            now = now_tz()
             if now.weekday() != AUTO_PUBLISH_DAY or now.hour != AUTO_PUBLISH_HOUR or now.minute >= 5:
                 await asyncio.sleep(60); continue
             week_key = f"auto_publish_{now.date().isoformat()}"
@@ -536,7 +565,7 @@ async def auto_publish_next_week():
                 embed = discord.Embed(
                     title="📢 Новая неделя — новые слоты!",
                     description=f"🗓️ Слоты на следующую неделю **уже доступны**!\n✅ Создано слотов: **{total}**\n\n👉 Открой `/shift` чтобы записаться",
-                    color=discord.Color.green(), timestamp=datetime.now()
+                    color=discord.Color.green(), timestamp=now_tz()
                 )
                 embed.set_footer(text="Auto-published every Sunday at 20:00")
                 async with aiosqlite.connect('shifts.db') as db:
@@ -609,7 +638,7 @@ async def send_monthly_report():
     await asyncio.sleep(10)
     while not bot.is_closed():
         try:
-            now = datetime.now()
+            now = now_tz()
             if now.day == 1 and now.hour == 0 and now.minute < 5:
                 month_start = (now - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0)
                 month_end = now.replace(day=1, hour=0, minute=0, second=0)
@@ -621,7 +650,7 @@ async def send_monthly_report():
                     stats = await cursor.fetchall()
                     await db.execute('DELETE FROM shifts WHERE end_time < ? AND is_active = 0', (month_end.isoformat(),))
                     await db.commit()
-                embed = discord.Embed(title=f"📊 Monthly Report - {month_start.strftime('%B %Y')}", color=discord.Color.gold(), timestamp=datetime.now())
+                embed = discord.Embed(title=f"📊 Monthly Report - {month_start.strftime('%B %Y')}", color=discord.Color.gold(), timestamp=now_tz())
                 if stats:
                     total_s = sum(s[3] for s in stats if s[3])
                     embed.add_field(name="📈 Summary", value=f"Employees: {len(stats)}\nShifts: {sum(s[2] for s in stats)}\nHours: {format_time(total_s)}", inline=False)
@@ -650,7 +679,7 @@ async def create_shift_panel(interaction: discord.Interaction, edit: bool = Fals
         active_users = await get_active_shifts(interaction.guild_id)
         today_slots = await get_today_slots(interaction.guild_id)
         my_bookings = await get_user_bookings(interaction.user.id, interaction.guild_id)
-        embed = discord.Embed(title="📋 Shift Management", color=discord.Color.blue(), timestamp=datetime.now())
+        embed = discord.Embed(title="📋 Shift Management", color=discord.Color.blue(), timestamp=now_tz())
         status = "🟢 On Shift" if active_shift else "🔴 Off Shift"
         embed.add_field(name="Your Status", value=f"{status}\n{interaction.user.mention}", inline=False)
         if today_slots:
@@ -668,7 +697,7 @@ async def create_shift_panel(interaction: discord.Interaction, edit: bool = Fals
             text = [f"✅ {day_name(d)} {s}-{e} (ID: {bid})" for bid, sid, s, e, d in my_bookings]
             embed.add_field(name="📝 My Bookings", value="\n".join(text[:10]), inline=False)
         if active_users:
-            text = [f"👤 {u[1]} — {int((datetime.now()-datetime.fromisoformat(u[2])).total_seconds()/3600)}h" for u in active_users[:10]]
+            text = [f"👤 {u[1]} — {int((now_tz()-datetime.fromisoformat(u[2])).total_seconds()/3600)}h" for u in active_users[:10]]
             embed.add_field(name=f"👥 On Shift ({len(active_users)})", value="\n".join(text), inline=False)
         else:
             embed.add_field(name="👥 On Shift (0)", value="No one is on shift", inline=False)
@@ -757,11 +786,11 @@ async def shift_cmd(interaction: discord.Interaction):
 async def onshift_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     users = await get_active_shifts(interaction.guild_id)
-    embed = discord.Embed(title="👥 Who is on shift", color=discord.Color.blue(), timestamp=datetime.now())
+    embed = discord.Embed(title="👥 Who is on shift", color=discord.Color.blue(), timestamp=now_tz())
     if users:
         text = []
         for u in users:
-            secs = (datetime.now() - datetime.fromisoformat(u[2])).total_seconds()
+            secs = (now_tz() - datetime.fromisoformat(u[2])).total_seconds()
             text.append(f"👤 {u[1]} — **{int(secs/3600)}h {int((secs%3600)/60)}min** (since {u[2][11:16]})")
         embed.description = "\n".join(text)
     else:
@@ -772,17 +801,17 @@ async def onshift_cmd(interaction: discord.Interaction):
 async def stats_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     async with aiosqlite.connect('shifts.db') as db:
-        today = datetime.now().date().isoformat()
+        today = now_tz().date().isoformat()
         cursor = await db.execute('SELECT start_time, end_time FROM shifts WHERE user_id = ? AND guild_id = ? AND is_active = 0 AND date(start_time) = ?',
                                   (interaction.user.id, interaction.guild_id, today))
         today_shifts = await cursor.fetchall()
-        week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+        week_ago = (now_tz() - timedelta(days=7)).isoformat()
         cursor = await db.execute('SELECT start_time, end_time FROM shifts WHERE user_id = ? AND guild_id = ? AND is_active = 0 AND start_time > ?',
                                   (interaction.user.id, interaction.guild_id, week_ago))
         week_shifts = await cursor.fetchall()
     def calc(sh):
         return sum((datetime.fromisoformat(s[1]) - datetime.fromisoformat(s[0])).total_seconds()/3600 for s in sh if s[1])
-    embed = discord.Embed(title=f"📊 Statistics for {interaction.user.name}", color=discord.Color.gold(), timestamp=datetime.now())
+    embed = discord.Embed(title=f"📊 Statistics for {interaction.user.name}", color=discord.Color.gold(), timestamp=now_tz())
     embed.add_field(name="📅 Today", value=f"{calc(today_shifts):.1f} h\n({len(today_shifts)} shifts)", inline=True)
     embed.add_field(name="📅 Week", value=f"{calc(week_shifts):.1f} h\n({len(week_shifts)} shifts)", inline=True)
     await interaction.followup.send(embed=embed, ephemeral=True)
@@ -797,14 +826,14 @@ async def userstats_cmd(interaction: discord.Interaction, user: discord.Member):
     if not shifts:
         await interaction.followup.send(f"📭 {user.mention} has no shifts.", ephemeral=True); return
     total = today_s = week_s = month_s = 0
-    td = datetime.now().date(); wk = datetime.now()-timedelta(days=7); mo = datetime.now()-timedelta(days=30)
+    td = now_tz().date(); wk = now_tz()-timedelta(days=7); mo = now_tz()-timedelta(days=30)
     for s, e in shifts:
         start = datetime.fromisoformat(s); end = datetime.fromisoformat(e)
         d = (end-start).total_seconds(); total += d
         if start.date() == td: today_s += d
         if start >= wk: week_s += d
         if start >= mo: month_s += d
-    embed = discord.Embed(title=f"📊 Statistics for {user.display_name}", color=discord.Color.blue(), timestamp=datetime.now())
+    embed = discord.Embed(title=f"📊 Statistics for {user.display_name}", color=discord.Color.blue(), timestamp=now_tz())
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="📅 Total Shifts", value=f"**{len(shifts)}**", inline=False)
     embed.add_field(name="⏱️ Total", value=format_time(total), inline=True)
@@ -823,7 +852,7 @@ async def top_cmd(interaction: discord.Interaction):
         stats = await cursor.fetchall()
     if not stats:
         await interaction.followup.send("📭 No data.", ephemeral=True); return
-    embed = discord.Embed(title="🏆 Top Employees", color=discord.Color.gold(), timestamp=datetime.now())
+    embed = discord.Embed(title="🏆 Top Employees", color=discord.Color.gold(), timestamp=now_tz())
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
     for i, (uid, un, sh, secs) in enumerate(stats):
         m = interaction.guild.get_member(uid)
@@ -921,7 +950,7 @@ async def list_templates(interaction: discord.Interaction):
         templates = await cursor.fetchall()
     if not templates:
         await interaction.followup.send("📭 No templates saved.", ephemeral=True); return
-    embed = discord.Embed(title="📋 Slot Templates", color=discord.Color.blue(), timestamp=datetime.now())
+    embed = discord.Embed(title="📋 Slot Templates", color=discord.Color.blue(), timestamp=now_tz())
     for name, start, end, maxp, days in templates:
         embed.add_field(name=f"💾 {name}", value=f"Time: {start}-{end}\nSpots: {maxp}\nDays: {days}", inline=False)
     await interaction.followup.send(embed=embed)
@@ -1039,7 +1068,7 @@ async def list_slots(interaction: discord.Interaction):
     slots = await get_all_active_slots(interaction.guild_id)
     if not slots:
         await interaction.followup.send("📭 No slots.", ephemeral=True); return
-    embed = discord.Embed(title="📋 All Slots", color=discord.Color.blue(), timestamp=datetime.now())
+    embed = discord.Embed(title="📋 All Slots", color=discord.Color.blue(), timestamp=now_tz())
     for sid, start, end, maxp, day, booked in slots[:25]:
         embed.add_field(name=f"ID:{sid} {day_name(day)} {start}-{end}", value=f"Booked: {booked}/{maxp}", inline=False)
     await interaction.followup.send(embed=embed)
@@ -1083,11 +1112,11 @@ async def delete_user_shifts(interaction: discord.Interaction, user: discord.Mem
     query = "DELETE FROM shifts WHERE user_id = ? AND guild_id = ?"
     params = [user.id, interaction.guild_id]
     if period == "today":
-        query += " AND date(start_time) = ?"; params.append(datetime.now().date().isoformat())
+        query += " AND date(start_time) = ?"; params.append(now_tz().date().isoformat())
     elif period == "week":
-        query += " AND start_time >= ?"; params.append((datetime.now() - timedelta(days=7)).isoformat())
+        query += " AND start_time >= ?"; params.append((now_tz() - timedelta(days=7)).isoformat())
     elif period == "month":
-        query += " AND start_time >= ?"; params.append((datetime.now() - timedelta(days=30)).isoformat())
+        query += " AND start_time >= ?"; params.append((now_tz() - timedelta(days=30)).isoformat())
     async with aiosqlite.connect('shifts.db') as db:
         cursor = await db.execute(query, params)
         deleted = cursor.rowcount
@@ -1129,13 +1158,13 @@ async def test_rep(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ No permission!", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
-    now = datetime.now(); month_start = now.replace(day=1, hour=0, minute=0, second=0)
+    now = now_tz(); month_start = now.replace(day=1, hour=0, minute=0, second=0)
     async with aiosqlite.connect('shifts.db') as db:
         cursor = await db.execute('''SELECT user_id, username, COUNT(*), SUM(strftime('%s',end_time)-strftime('%s',start_time))
             FROM shifts WHERE guild_id IS NOT NULL AND is_active = 0 AND end_time IS NOT NULL AND start_time >= ?
             GROUP BY user_id, username ORDER BY 4 DESC''', (month_start.isoformat(),))
         stats = await cursor.fetchall()
-    embed = discord.Embed(title=f"📊 Test Report - {month_start.strftime('%B %Y')}", color=discord.Color.gold(), timestamp=datetime.now())
+    embed = discord.Embed(title=f"📊 Test Report - {month_start.strftime('%B %Y')}", color=discord.Color.gold(), timestamp=now_tz())
     if stats:
         total_s = sum(s[3] for s in stats if s[3])
         embed.add_field(name="📈 Summary", value=f"Employees: {len(stats)}\nShifts: {sum(s[2] for s in stats)}\nHours: {format_time(total_s)}", inline=False)
@@ -1161,7 +1190,7 @@ async def force_end_shift(interaction: discord.Interaction, user: discord.Member
             await interaction.followup.send(f"❌ У {user.mention} нет активной смены.", ephemeral=True)
             return
         shift_id, start_time = shift
-        now = datetime.now()
+        now = now_tz()
         duration = now - datetime.fromisoformat(start_time)
         duration_str = f"{int(duration.total_seconds()/3600)}h {int((duration.total_seconds()%3600)/60)}min"
         await db.execute(
@@ -1174,7 +1203,7 @@ async def force_end_shift(interaction: discord.Interaction, user: discord.Member
             embed = discord.Embed(
                 title="🔴 Shift Force Ended",
                 description=f"**{user.name}**'s shift was ended by {interaction.user.mention}",
-                color=discord.Color.dark_red(), timestamp=datetime.now())
+                color=discord.Color.dark_red(), timestamp=now_tz())
             embed.add_field(name="⏱️ Duration", value=duration_str, inline=True)
             embed.add_field(name="👮 Ended by", value=interaction.user.name, inline=True)
             await channel.send(embed=embed)
@@ -1184,7 +1213,7 @@ async def force_end_shift(interaction: discord.Interaction, user: discord.Member
         embed_dm = discord.Embed(
             title="🔴 Your shift was ended",
             description=f"Ваша смена была завершена администратором {interaction.user.name}.",
-            color=discord.Color.red(), timestamp=datetime.now())
+            color=discord.Color.red(), timestamp=now_tz())
         embed_dm.add_field(name="⏱️ Duration", value=duration_str, inline=True)
         await user.send(embed=embed_dm)
     except discord.Forbidden:
@@ -1194,7 +1223,7 @@ async def force_end_shift(interaction: discord.Interaction, user: discord.Member
     embed = discord.Embed(
         title="✅ Shift Ended",
         description=f"Смена {user.mention} завершена.\n**Длительность:** {duration_str}",
-        color=discord.Color.green(), timestamp=datetime.now())
+        color=discord.Color.green(), timestamp=now_tz())
     embed.set_footer(text=f"Ended by: {interaction.user.name}")
     await interaction.followup.send(embed=embed)
 
@@ -1212,7 +1241,7 @@ async def force_end_all(interaction: discord.Interaction):
         if not shifts:
             await interaction.followup.send("📭 Нет активных смен.", ephemeral=True)
             return
-        now = datetime.now()
+        now = now_tz()
         ended_users = []
         for shift_id, user_id, username, start_time in shifts:
             duration = now - datetime.fromisoformat(start_time)
@@ -1228,7 +1257,7 @@ async def force_end_all(interaction: discord.Interaction):
             embed = discord.Embed(
                 title="🔴 All Shifts Force Ended",
                 description=f"Завершено **{len(ended_users)}** смен администратором {interaction.user.mention}",
-                color=discord.Color.dark_red(), timestamp=datetime.now())
+                color=discord.Color.dark_red(), timestamp=now_tz())
             user_list = []
             for uid, uname, dur in ended_users[:15]:
                 user_list.append(f"👤 {uname} — {dur}")
@@ -1241,7 +1270,7 @@ async def force_end_all(interaction: discord.Interaction):
     embed = discord.Embed(
         title="✅ All Shifts Ended",
         description=f"Завершено **{len(ended_users)}** смен.",
-        color=discord.Color.green(), timestamp=datetime.now())
+        color=discord.Color.green(), timestamp=now_tz())
     embed.set_footer(text=f"Ended by: {interaction.user.name}")
     await interaction.followup.send(embed=embed)
 
@@ -1263,7 +1292,7 @@ async def force_end_shift_id(interaction: discord.Interaction, shift_id: int):
         if not is_active:
             await interaction.followup.send(f"⚠️ Смена `{shift_id}` уже завершена.", ephemeral=True)
             return
-        now = datetime.now()
+        now = now_tz()
         duration = now - datetime.fromisoformat(start_time)
         duration_str = f"{int(duration.total_seconds()/3600)}h {int((duration.total_seconds()%3600)/60)}min"
         await db.execute(
