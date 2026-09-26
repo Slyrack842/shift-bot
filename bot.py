@@ -281,6 +281,57 @@ async def send_shift_end_notification(user_id, username, duration, guild_id):
             await channel.send(embed=embed)
     except Exception as e: print(f"❌ End notification error: {e}")
 
+# --- DAILY CLEANUP (удаляет вчерашние смены) ---
+async def cleanup_yesterday():
+    """Каждый день в 00:05 удаляет смены и брони за вчерашний день"""
+    await bot.wait_until_ready()
+    await asyncio.sleep(60)
+    
+    while not bot.is_closed():
+        try:
+            now = now_tz()
+            if now.hour != 0 or now.minute < 5 or now.minute > 10:
+                await asyncio.sleep(60)
+                continue
+            
+            today_key = f"daily_cleanup_{now.date().isoformat()}"
+            async with aiosqlite.connect('shifts.db') as db:
+                cursor = await db.execute('SELECT value FROM settings WHERE key = ?', (today_key,))
+                if await cursor.fetchone():
+                    await asyncio.sleep(3600)
+                    continue
+            
+            yesterday = (now - timedelta(days=1)).date().isoformat()
+            yesterday_day = (now.weekday() - 1) % 7
+            
+            print(f"🗑️ Очистка за {yesterday}")
+            
+            async with aiosqlite.connect('shifts.db') as db:
+                cursor = await db.execute('DELETE FROM shifts WHERE is_active = 0 AND date(end_time) = ?', (yesterday,))
+                deleted_shifts = cursor.rowcount
+                
+                cursor = await db.execute('DELETE FROM bookings WHERE slot_id IN (SELECT id FROM slots WHERE day_of_week = ?)', (yesterday_day,))
+                deleted_bookings = cursor.rowcount
+                await db.commit()
+            
+            async with aiosqlite.connect('shifts.db') as db:
+                await db.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (today_key, "done"))
+                await db.commit()
+            
+            print(f"✅ Удалено: смен {deleted_shifts}, броней {deleted_bookings}")
+            
+            try:
+                if REPORT_USER_ID:
+                    u = await bot.fetch_user(REPORT_USER_ID)
+                    if u:
+                        await u.send(f"🗑️ **Очистка за {yesterday}**\n• Смен: **{deleted_shifts}**\n• Броней: **{deleted_bookings}**")
+            except: pass
+            
+            await asyncio.sleep(86400)
+        except Exception as e:
+            print(f"❌ cleanup_yesterday error: {e}")
+            await asyncio.sleep(3600)
+
 # --- LONG SHIFT REMINDERS ---
 async def check_long_shifts():
     await bot.wait_until_ready()
@@ -528,6 +579,14 @@ async def auto_publish_next_week():
                 cursor = await db.execute('SELECT value FROM settings WHERE key = ?', (week_key,))
                 if await cursor.fetchone():
                     await asyncio.sleep(3600); continue
+            
+            # Удаляем старые слоты и брони перед созданием новых
+            async with aiosqlite.connect('shifts.db') as db:
+                await db.execute('DELETE FROM bookings')
+                await db.execute('DELETE FROM slots')
+                await db.commit()
+                print("🗑️ Старые слоты и брони удалены")
+            
             async with aiosqlite.connect('shifts.db') as db:
                 cursor = await db.execute('SELECT guild_id, name, start_time, end_time, max_people, days FROM slot_templates')
                 templates = await cursor.fetchall()
@@ -538,10 +597,6 @@ async def auto_publish_next_week():
                 await asyncio.sleep(86400); continue
             created_by_guild = {}
             for guild_id, name, start, end, max_p, days_str in templates:
-                async with aiosqlite.connect('shifts.db') as db:
-                    cursor = await db.execute('SELECT COUNT(*) FROM slots WHERE guild_id = ? AND start_time = ? AND end_time = ?',
-                                              (guild_id, start, end))
-                    if (await cursor.fetchone())[0] > 0: continue
                 days = parse_days(days_str)
                 count = 0
                 async with aiosqlite.connect('shifts.db') as db:
@@ -583,7 +638,7 @@ async def auto_publish_next_week():
             try:
                 if REPORT_USER_ID:
                     u = await bot.fetch_user(REPORT_USER_ID)
-                    if u: await u.send(f"✅ Авто-публикация: создано **{sum(created_by_guild.values())}** слотов.")
+                    if u: await u.send(f"✅ Авто-публикация: старые удалены, создано **{sum(created_by_guild.values())}** новых слотов.")
             except: pass
             await asyncio.sleep(86400)
         except Exception as e:
@@ -771,6 +826,7 @@ async def on_ready():
     bot.loop.create_task(send_monthly_report())
     bot.loop.create_task(slot_notification_loop())
     bot.loop.create_task(auto_publish_next_week())
+    bot.loop.create_task(cleanup_yesterday())
 
 # ==================== USER COMMANDS ====================
 @bot.tree.command(name='shift', description='📋 Manage your shift and book slots')
@@ -1301,6 +1357,31 @@ async def force_end_shift_id(interaction: discord.Interaction, shift_id: int):
         f"👤 Пользователь: <@{user_id}>\n"
         f"⏱️ Длительность: {duration_str}",
         ephemeral=True)
+
+
+@bot.tree.command(name='cleanup-now', description='🗑️ Очистить вчерашние смены (админ)')
+async def cleanup_now(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Нет доступа!", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    
+    now = now_tz()
+    yesterday = (now - timedelta(days=1)).date().isoformat()
+    yesterday_day = (now.weekday() - 1) % 7
+    
+    async with aiosqlite.connect('shifts.db') as db:
+        cursor = await db.execute('DELETE FROM shifts WHERE is_active = 0 AND date(end_time) = ?', (yesterday,))
+        deleted_shifts = cursor.rowcount
+        
+        cursor = await db.execute('DELETE FROM bookings WHERE slot_id IN (SELECT id FROM slots WHERE day_of_week = ?)', (yesterday_day,))
+        deleted_bookings = cursor.rowcount
+        await db.commit()
+    
+    await interaction.followup.send(
+        f"✅ Очистка за {yesterday} выполнена!\n"
+        f"• Смен удалено: **{deleted_shifts}**\n"
+        f"• Броней удалено: **{deleted_bookings}**"
+    )
 
 # --- BUTTON HANDLERS ---
 @bot.event
