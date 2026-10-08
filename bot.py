@@ -34,42 +34,46 @@ bot = commands.Bot(
 # --- SETTINGS ---
 REPORT_CHANNEL_ID = 1533758067513098408
 SLOT_NOTIFICATION_CHANNEL_ID = 1544455513964675143
-VACATION_CHANNEL_ID = 1555074713405890671   # ✅ New channel for vacation/sick
+VACATION_CHANNEL_ID = 1555074713405890671
 REPORT_USER_ID = 775396551936704533
 
 REMINDER_HOURS = 4
 URGENT_HOURS = 8
 CHECK_INTERVAL = 30
 
-NOTIFICATION_TIME_HOUR = 9
-TOMORROW_NOTIFICATION_HOUR = 12
+# ✅ Уведомление о слотах на сегодня в 00:10 МСК
+NOTIFICATION_TIME_HOUR = 0
+NOTIFICATION_TIME_MINUTE = 10
 
-# ✅ Reminder at 14:00
-REMINDER_14_HOUR = 14
+# Уведомление о слотах на завтра в 15:00 МСК
+TOMORROW_NOTIFICATION_HOUR = 15
+
+# Напоминание записаться в 17:00 МСК
+REMINDER_14_HOUR = 17
 REMINDER_14_MINUTE = 0
 
 AUTO_PUBLISH_ENABLED = True
 AUTO_PUBLISH_DAY = 6
-AUTO_PUBLISH_HOUR = 20
+AUTO_PUBLISH_HOUR = 23   # Вс 23:00 МСК
 AUTO_PUBLISH_PING_ROLE_ID = 1533758065323540565
 
 ADMIN_ROLE_IDS = [
     1533758065352900822,
 ]
 
-# ✅ On-shift role
 ON_SHIFT_ROLE_ID = 1533758065323540563
 
-# ✅ No-show check
 NO_SHOW_MINUTES = 15
 NO_SHOW_CHECK_INTERVAL = 5
 
 SLOT_REMINDERS = [15]
 DEFAULT_MAX_PEOPLE = 3
 
-# --- TIMEZONE: UTC (server time) ---
+# ✅ GMT+3 (Москва)
+TIMEZONE_OFFSET = 3
+
 def now_tz():
-    return datetime.now()
+    return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
 
 # --- DATABASE ---
 async def init_db():
@@ -164,7 +168,6 @@ def is_admin(interaction: discord.Interaction) -> bool:
         if role_id in user_role_ids: return True
     return False
 
-# ✅ Check vacation
 async def is_on_vacation(user_id, guild_id):
     today = now_tz().date().isoformat()
     async with aiosqlite.connect('shifts.db') as db:
@@ -175,24 +178,46 @@ async def is_on_vacation(user_id, guild_id):
         ''', (user_id, guild_id, today, today))
         return await cursor.fetchone() is not None
 
-# ✅ On-shift role management
 async def add_on_shift_role(guild, user_id):
     try:
         member = guild.get_member(user_id)
+        if not member:
+            try:
+                member = await guild.fetch_member(user_id)
+            except:
+                print(f"❌ Member {user_id} not found")
+                return
         role = guild.get_role(ON_SHIFT_ROLE_ID)
-        if member and role:
-            await member.add_roles(role)
-            print(f"✅ On-shift role added to {member.name}")
+        if not role:
+            print(f"❌ Role {ON_SHIFT_ROLE_ID} not found")
+            return
+        if role in member.roles:
+            return
+        bot_member = guild.get_member(bot.user.id)
+        if not bot_member.guild_permissions.manage_roles:
+            print(f"❌ Bot has no Manage Roles permission!")
+            return
+        if bot_member.top_role.position <= role.position:
+            print(f"❌ Bot role is NOT above On-Shift role")
+            return
+        await member.add_roles(role, reason="Shift started")
+        print(f"✅ On-Shift role added to {member.name}")
     except Exception as e:
         print(f"❌ Role add error: {e}")
 
 async def remove_on_shift_role(guild, user_id):
     try:
         member = guild.get_member(user_id)
+        if not member:
+            try:
+                member = await guild.fetch_member(user_id)
+            except:
+                return
         role = guild.get_role(ON_SHIFT_ROLE_ID)
-        if member and role and role in member.roles:
-            await member.remove_roles(role)
-            print(f"✅ On-shift role removed from {member.name}")
+        if not role: return
+        if role not in member.roles: return
+        await member.remove_roles(role, reason="Shift ended")
+        print(f"✅ On-Shift role removed from {member.name}")
     except Exception as e:
         print(f"❌ Role remove error: {e}")
 
@@ -338,7 +363,7 @@ async def send_shift_end_notification(user_id, username, duration, guild_id):
             await channel.send(embed=embed)
     except Exception as e: print(f"❌ End notification error: {e}")
 
-# ✅ No-show check
+# --- NO-SHOW CHECK ---
 async def check_no_shows():
     await bot.wait_until_ready()
     await asyncio.sleep(60)
@@ -346,104 +371,69 @@ async def check_no_shows():
         try:
             now = now_tz()
             today = now.weekday()
-            
             async with aiosqlite.connect('shifts.db') as db:
-                cursor = await db.execute('''
-                    SELECT id, start_time, end_time, guild_id FROM slots
-                    WHERE is_active = 1 AND (day_of_week = ? OR day_of_week IS NULL)
-                ''', (today,))
+                cursor = await db.execute('SELECT id, start_time, end_time, guild_id FROM slots WHERE is_active = 1 AND (day_of_week = ? OR day_of_week IS NULL)', (today,))
                 slots = await cursor.fetchall()
-            
             for slot_id, start, end, guild_id in slots:
                 try:
                     start_dt = datetime.strptime(start, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
-                except:
-                    continue
-                
+                except: continue
                 minutes_passed = (now - start_dt).total_seconds() / 60
-                if minutes_passed < NO_SHOW_MINUTES or minutes_passed > 90:
-                    continue
-                
+                if minutes_passed < NO_SHOW_MINUTES or minutes_passed > 90: continue
                 async with aiosqlite.connect('shifts.db') as db:
-                    cursor = await db.execute('''
-                        SELECT b.id, b.user_id, b.username FROM bookings b
-                        WHERE b.slot_id = ? AND b.status = 'booked'
-                    ''', (slot_id,))
+                    cursor = await db.execute('SELECT b.id, b.user_id, b.username FROM bookings b WHERE b.slot_id = ? AND b.status = "booked"', (slot_id,))
                     bookings = await cursor.fetchall()
-                
                 for booking_id, user_id, username in bookings:
                     async with aiosqlite.connect('shifts.db') as db:
                         cursor = await db.execute('SELECT id FROM no_show_notifications WHERE booking_id = ?', (booking_id,))
-                        if await cursor.fetchone():
-                            continue
-                    
+                        if await cursor.fetchone(): continue
                     async with aiosqlite.connect('shifts.db') as db:
-                        cursor = await db.execute('''
-                            SELECT id FROM shifts 
-                            WHERE user_id = ? AND guild_id = ? AND is_active = 1
-                        ''', (user_id, guild_id))
-                        active = await cursor.fetchone()
-                    
-                    if active:
-                        continue
-                    
+                        cursor = await db.execute('SELECT id FROM shifts WHERE user_id = ? AND guild_id = ? AND is_active = 1', (user_id, guild_id))
+                        if await cursor.fetchone(): continue
                     async with aiosqlite.connect('shifts.db') as db:
                         await db.execute('UPDATE bookings SET status = "no_show" WHERE id = ?', (booking_id,))
-                        await db.execute('INSERT INTO no_show_notifications (booking_id, sent_at) VALUES (?, ?)',
-                                         (booking_id, now.isoformat()))
+                        await db.execute('INSERT INTO no_show_notifications (booking_id, sent_at) VALUES (?, ?)', (booking_id, now.isoformat()))
                         await db.commit()
-                    
                     try:
                         channel = bot.get_channel(REPORT_CHANNEL_ID)
                         if channel:
-                            embed = discord.Embed(
-                                title="⚠️ NO-SHOW DETECTED",
+                            embed = discord.Embed(title="⚠️ NO-SHOW DETECTED",
                                 description=f"**{username}** did not start their shift within {NO_SHOW_MINUTES} minutes!",
-                                color=discord.Color.orange(),
-                                timestamp=now_tz()
-                            )
+                                color=discord.Color.orange(), timestamp=now_tz())
                             embed.add_field(name="📅 Slot", value=f"{start} - {end}", inline=True)
                             embed.add_field(name="👤 Employee", value=f"<@{user_id}>", inline=True)
                             await channel.send(embed=embed)
-                    except Exception as e:
-                        print(f"❌ No-show notification error: {e}")
-                    
+                    except: pass
                     try:
                         user = await bot.fetch_user(user_id)
                         if user:
-                            embed_dm = discord.Embed(
-                                title="⚠️ You missed your shift!",
+                            dm_embed = discord.Embed(title="⚠️ You missed your shift!",
                                 description=f"You booked slot **{start} - {end}** but did not start your shift.",
-                                color=discord.Color.orange(),
-                                timestamp=now_tz()
-                            )
-                            await user.send(embed=embed_dm)
+                                color=discord.Color.orange(), timestamp=now_tz())
+                            await user.send(embed=dm_embed)
                     except: pass
-            
             await asyncio.sleep(NO_SHOW_CHECK_INTERVAL * 60)
         except Exception as e:
             print(f"❌ check_no_shows error: {e}")
             await asyncio.sleep(60)
 
-# --- DAILY CLEANUP ---
+# --- DAILY CLEANUP (00:15 MSK) ---
 async def cleanup_yesterday():
     await bot.wait_until_ready()
     await asyncio.sleep(60)
     while not bot.is_closed():
         try:
             now = now_tz()
-            if now.hour != 0 or now.minute < 5 or now.minute > 10:
-                await asyncio.sleep(60)
-                continue
+            # ✅ Очистка в 00:15 МСК
+            if now.hour != 0 or now.minute < 15 or now.minute > 20:
+                await asyncio.sleep(60); continue
             today_key = f"daily_cleanup_{now.date().isoformat()}"
             async with aiosqlite.connect('shifts.db') as db:
                 cursor = await db.execute('SELECT value FROM settings WHERE key = ?', (today_key,))
                 if await cursor.fetchone():
-                    await asyncio.sleep(3600)
-                    continue
+                    await asyncio.sleep(3600); continue
             yesterday = (now - timedelta(days=1)).date().isoformat()
             yesterday_day = (now.weekday() - 1) % 7
-            print(f"🗑️ Cleanup for {yesterday}")
             async with aiosqlite.connect('shifts.db') as db:
                 cursor = await db.execute('DELETE FROM shifts WHERE is_active = 0 AND date(end_time) = ?', (yesterday,))
                 deleted_shifts = cursor.rowcount
@@ -453,11 +443,69 @@ async def cleanup_yesterday():
             async with aiosqlite.connect('shifts.db') as db:
                 await db.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (today_key, "done"))
                 await db.commit()
-            print(f"✅ Deleted: {deleted_shifts} shifts, {deleted_bookings} bookings")
+            print(f"✅ Cleanup at 00:15: {deleted_shifts} shifts, {deleted_bookings} bookings deleted")
             await asyncio.sleep(86400)
         except Exception as e:
             print(f"❌ cleanup_yesterday error: {e}")
             await asyncio.sleep(3600)
+
+# --- AUTO-CLOSE SHIFTS (00:05 MSK) ---
+async def auto_close_shifts():
+    await bot.wait_until_ready()
+    await asyncio.sleep(60)
+    while not bot.is_closed():
+        try:
+            now = now_tz()
+            # ✅ Автозакрытие в 00:05 МСК
+            if now.hour == 0 and 5 <= now.minute < 10:
+                today_key = f"auto_close_{now.date().isoformat()}"
+                async with aiosqlite.connect('shifts.db') as db:
+                    cursor = await db.execute('SELECT value FROM settings WHERE key = ?', (today_key,))
+                    if await cursor.fetchone():
+                        await asyncio.sleep(60); continue
+                async with aiosqlite.connect('shifts.db') as db:
+                    cursor = await db.execute('SELECT id, user_id, start_time, guild_id FROM shifts WHERE is_active = 1')
+                    active = await cursor.fetchall()
+                    if active:
+                        for shift_id, user_id, start_time, guild_id in active:
+                            await db.execute('UPDATE shifts SET end_time = ?, is_active = 0 WHERE id = ?', (now.isoformat(), shift_id))
+                            try:
+                                guild = bot.get_guild(guild_id)
+                                if guild: await remove_on_shift_role(guild, user_id)
+                            except: pass
+                        await db.commit()
+                        print(f"🌙 Auto-closed {len(active)} shifts at 00:05")
+                async with aiosqlite.connect('shifts.db') as db:
+                    await db.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (today_key, "done"))
+                    await db.commit()
+                await asyncio.sleep(3600); continue
+            await asyncio.sleep(60)
+        except Exception as e:
+            print(f"❌ auto_close_shifts error: {e}")
+            await asyncio.sleep(60)
+
+# --- CLEANUP HUNG ROLES ---
+async def cleanup_hung_roles():
+    await bot.wait_until_ready()
+    await asyncio.sleep(30)
+    try:
+        for guild in bot.guilds:
+            role = guild.get_role(ON_SHIFT_ROLE_ID)
+            if not role: continue
+            async with aiosqlite.connect('shifts.db') as db:
+                cursor = await db.execute('SELECT user_id FROM shifts WHERE guild_id = ? AND is_active = 1', (guild.id,))
+                active_users = {row[0] for row in await cursor.fetchall()}
+            removed = 0
+            for member in role.members:
+                if member.id not in active_users:
+                    try:
+                        await member.remove_roles(role)
+                        removed += 1
+                    except: pass
+            if removed:
+                print(f"🧹 Removed hung role from {removed} users on {guild.name}")
+    except Exception as e:
+        print(f"❌ cleanup_hung_roles error: {e}")
 
 # --- LONG SHIFT REMINDERS ---
 async def check_long_shifts():
@@ -583,7 +631,7 @@ async def build_tomorrow_notification_embed(guild):
     embed.set_footer(text=f"Tomorrow: {tomorrow_name}")
     return embed, free_slots
 
-# --- SEND NOTIFICATIONS (with role ping) ---
+# --- SEND NOTIFICATIONS ---
 async def send_slot_notification():
     try:
         for guild in bot.guilds:
@@ -591,13 +639,9 @@ async def send_slot_notification():
             if not channel: continue
             embed, free_slots = await build_slot_notification_embed(guild)
             view = SlotNotificationView(guild.id, free_slots)
-            msg = await channel.send(
-                content=f"<@&{AUTO_PUBLISH_PING_ROLE_ID}>",
-                embed=embed, 
-                view=view
-            )
+            msg = await channel.send(content=f"<@&{AUTO_PUBLISH_PING_ROLE_ID}>", embed=embed, view=view)
             await save_notification_message(guild.id, channel.id, msg.id, is_tomorrow=False)
-            print(f"✅ Today notification sent to {guild.name}")
+            print(f"✅ Today notification sent")
     except Exception as e: print(f"❌ Error sending today notification: {e}")
 
 async def send_tomorrow_notification():
@@ -607,13 +651,9 @@ async def send_tomorrow_notification():
             if not channel: continue
             embed, free_slots = await build_tomorrow_notification_embed(guild)
             view = SlotNotificationView(guild.id, free_slots)
-            msg = await channel.send(
-                content=f"<@&{AUTO_PUBLISH_PING_ROLE_ID}>",
-                embed=embed, 
-                view=view
-            )
+            msg = await channel.send(content=f"<@&{AUTO_PUBLISH_PING_ROLE_ID}>", embed=embed, view=view)
             await save_notification_message(guild.id, channel.id, msg.id, is_tomorrow=True)
-            print(f"✅ Tomorrow notification sent to {guild.name}")
+            print(f"✅ Tomorrow notification sent")
     except Exception as e: print(f"❌ Error sending tomorrow notification: {e}")
 
 async def update_tomorrow_notification(guild_id):
@@ -650,7 +690,7 @@ async def update_slot_notification(guild_id):
         await update_tomorrow_notification(guild_id)
     except Exception as e: print(f"❌ Error updating notifications: {e}")
 
-# --- NOTIFICATION LOOP ---
+# --- NOTIFICATION LOOP (00:10 MSK для сегодня + 15:00 MSK для завтра) ---
 async def slot_notification_loop():
     await bot.wait_until_ready()
     await asyncio.sleep(30)
@@ -658,7 +698,8 @@ async def slot_notification_loop():
         try:
             now = now_tz()
             today_key = now.date().isoformat()
-            if now.hour == NOTIFICATION_TIME_HOUR and now.minute < 5:
+            # ✅ Уведомление о сегодня в 00:10 МСК
+            if now.hour == NOTIFICATION_TIME_HOUR and NOTIFICATION_TIME_MINUTE <= now.minute < NOTIFICATION_TIME_MINUTE + 5:
                 key = f"daily_notification_{today_key}"
                 async with aiosqlite.connect('shifts.db') as db:
                     cursor = await db.execute('SELECT value FROM settings WHERE key = ?', (key,))
@@ -668,7 +709,9 @@ async def slot_notification_loop():
                 async with aiosqlite.connect('shifts.db') as db:
                     await db.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, "done"))
                     await db.commit()
+                print(f"✅ Today notification sent at {now.strftime('%H:%M')}")
                 await asyncio.sleep(3600); continue
+            # Уведомление о завтра в 15:00 МСК
             if now.hour == TOMORROW_NOTIFICATION_HOUR and now.minute < 5:
                 key = f"tomorrow_notification_{today_key}"
                 async with aiosqlite.connect('shifts.db') as db:
@@ -679,69 +722,52 @@ async def slot_notification_loop():
                 async with aiosqlite.connect('shifts.db') as db:
                     await db.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, "done"))
                     await db.commit()
+                print(f"✅ Tomorrow notification sent at {now.strftime('%H:%M')}")
                 await asyncio.sleep(3600); continue
             await asyncio.sleep(60)
         except Exception as e:
             print(f"❌ slot_notification_loop error: {e}")
             await asyncio.sleep(60)
 
-# ✅ Reminder at 14:00
+# --- REMINDER 17:00 MSK ---
 async def reminder_14_loop():
     await bot.wait_until_ready()
     await asyncio.sleep(30)
-    
     while not bot.is_closed():
         try:
             now = now_tz()
             today_key = now.date().isoformat()
-            
             if now.hour == REMINDER_14_HOUR and now.minute < 5:
                 key = f"reminder_14_{today_key}"
                 async with aiosqlite.connect('shifts.db') as db:
                     cursor = await db.execute('SELECT value FROM settings WHERE key = ?', (key,))
                     if await cursor.fetchone():
                         await asyncio.sleep(60); continue
-                
                 channel = bot.get_channel(SLOT_NOTIFICATION_CHANNEL_ID)
                 if channel:
                     tomorrow_slots = await get_tomorrow_slots(channel.guild.id)
-                    free_count = 0
-                    for slot_id, start, end, max_p, booked in tomorrow_slots:
-                        if booked < max_p:
-                            free_count += 1
-                    
-                    embed = discord.Embed(
-                        title="⏰ Reminder: Sign Up for Your Shift!",
-                        description=(
-                            f"📅 **Don't forget to sign up for tomorrow!**\n\n"
+                    free_count = sum(1 for s in tomorrow_slots if s[4] < s[3])
+                    embed = discord.Embed(title="⏰ Reminder: Sign Up for Your Shift!",
+                        description=(f"📅 **Don't forget to sign up for tomorrow!**\n\n"
                             f"🟢 Available slots for tomorrow: **{free_count}**\n"
                             f"📊 Total slots: **{len(tomorrow_slots)}**\n\n"
-                            f"👉 Open `/shift` and sign up!"
-                        ),
-                        color=discord.Color.gold(),
-                        timestamp=now_tz()
-                    )
-                    embed.set_footer(text="Reminder every day at 14:00")
-                    
+                            f"👉 Open `/shift` and sign up!"),
+                        color=discord.Color.gold(), timestamp=now_tz())
+                    embed.set_footer(text="Reminder every day at 17:00 MSK")
                     try:
                         await channel.send(content=f"<@&{AUTO_PUBLISH_PING_ROLE_ID}>", embed=embed)
-                        print(f"✅ Reminder 14:00 sent")
-                    except Exception as e:
-                        print(f"❌ Send error: {e}")
-                
+                        print(f"✅ Reminder 17:00 sent")
+                    except: pass
                 async with aiosqlite.connect('shifts.db') as db:
                     await db.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, "done"))
                     await db.commit()
-                
-                await asyncio.sleep(3600)
-                continue
-            
+                await asyncio.sleep(3600); continue
             await asyncio.sleep(60)
         except Exception as e:
             print(f"❌ reminder_14_loop error: {e}")
             await asyncio.sleep(60)
 
-# --- AUTO-PUBLISH ---
+# --- AUTO-PUBLISH (Sunday 23:00 MSK) ---
 async def auto_publish_next_week():
     await bot.wait_until_ready()
     await asyncio.sleep(60)
@@ -789,70 +815,19 @@ async def auto_publish_next_week():
                 embed = discord.Embed(title="📢 New Week — New Slots!",
                     description=f"🗓️ Slots for the next week are **now available**!\n✅ Slots created: **{total}**\n\n👉 Open `/shift` to sign up",
                     color=discord.Color.green(), timestamp=now_tz())
-                embed.set_footer(text="Auto-published every Sunday at 20:00")
-                async with aiosqlite.connect('shifts.db') as db:
-                    cursor = await db.execute('SELECT start_time, end_time, max_people, day_of_week FROM slots WHERE guild_id = ? AND is_active = 1 ORDER BY day_of_week, start_time', (channel.guild.id,))
-                    slots = await cursor.fetchall()
-                if slots:
-                    slots_by_day = {}
-                    for start, end, maxp, day in slots:
-                        slots_by_day.setdefault(day, []).append(f"{start}-{end} ({maxp} spots)")
-                    for day in sorted(slots_by_day.keys()):
-                        embed.add_field(name=f"📅 {day_name(day)}", value="\n".join(slots_by_day[day][:10]), inline=False)
+                embed.set_footer(text="Auto-published every Sunday at 23:00 MSK")
                 try:
                     await channel.send(content=f"<@&{AUTO_PUBLISH_PING_ROLE_ID}>", embed=embed)
-                except Exception as e:
-                    print(f"❌ Send error: {e}")
+                except: pass
             try:
                 if REPORT_USER_ID:
                     u = await bot.fetch_user(REPORT_USER_ID)
-                    if u: await u.send(f"✅ Auto-publish: old slots deleted, **{sum(created_by_guild.values())}** new slots created.")
+                    if u: await u.send(f"✅ Auto-publish: **{sum(created_by_guild.values())}** new slots created.")
             except: pass
             await asyncio.sleep(86400)
         except Exception as e:
             print(f"❌ auto_publish error: {e}")
             await asyncio.sleep(3600)
-
-# --- SLOT VIEW ---
-class SlotNotificationView(discord.ui.View):
-    def __init__(self, guild_id, free_slots):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-        if free_slots:
-            options = [discord.SelectOption(label=f"{s[1]} - {s[2]}", description=f"Free: {s[3]} spots", value=str(s[0])) for s in free_slots[:25]]
-            select = discord.ui.Select(placeholder="📅 Choose your shift...", options=options)
-            select.callback = self.select_callback
-            self.add_item(select)
-    async def select_callback(self, interaction: discord.Interaction):
-        slot_id = int(interaction.data['values'][0])
-        result = await book_slot(slot_id, interaction.user.id, interaction.user.name, interaction.guild_id)
-        if result == "success":
-            await interaction.response.send_message("✅ Booked! Your tag is now shown in the list.", ephemeral=True)
-            await update_slot_notification(interaction.guild_id)
-        elif result == "full":
-            await interaction.response.send_message("❌ Slot is now full.", ephemeral=True)
-        elif result == "already_booked":
-            await interaction.response.send_message("❌ You already booked this slot.", ephemeral=True)
-        elif result == "on_vacation":
-            await interaction.response.send_message("🏖️ You are on vacation! Cannot book slots.", ephemeral=True)
-        else:
-            await interaction.response.send_message("❌ Slot not found.", ephemeral=True)
-
-# --- STATUS ---
-async def update_status():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        try:
-            total = 0
-            for guild in bot.guilds:
-                total += len(await get_active_shifts(guild.id))
-            await bot.change_presence(
-                status=discord.Status.online,
-                activity=discord.Activity(type=discord.ActivityType.watching, name=f"{total} people on shift")
-            )
-        except Exception as e:
-            print(f"❌ Status update error: {e}")
-        await asyncio.sleep(30)
 
 # --- MONTHLY REPORT ---
 async def send_monthly_report():
@@ -892,7 +867,171 @@ async def send_monthly_report():
             print(f"❌ Monthly report error: {e}")
             await asyncio.sleep(3600)
 
-# --- SHIFT PANEL ---
+# --- STATUS ---
+async def update_status():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            total = 0
+            for guild in bot.guilds:
+                total += len(await get_active_shifts(guild.id))
+            await bot.change_presence(
+                status=discord.Status.online,
+                activity=discord.Activity(type=discord.ActivityType.watching, name=f"{total} people on shift")
+            )
+        except: pass
+        await asyncio.sleep(30)
+
+# ==================== VACATION REQUEST VIEW (BUTTONS) ====================
+class VacationRequestView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success, custom_id="vacation_approve")
+    async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Only admins can approve!", ephemeral=True)
+            return
+        message = interaction.message
+        vacation_id = None
+        if message.embeds and message.embeds[0].footer:
+            footer = message.embeds[0].footer.text
+            if "ID:" in footer:
+                try: vacation_id = int(footer.split("ID:")[1].strip().split()[0])
+                except: pass
+        if not vacation_id:
+            await interaction.response.send_message("❌ Cannot find vacation ID!", ephemeral=True); return
+        await interaction.response.defer()
+        async with aiosqlite.connect('shifts.db') as db:
+            cursor = await db.execute('SELECT user_id, start_date, end_date FROM vacations WHERE id = ?', (vacation_id,))
+            vac = await cursor.fetchone()
+            if not vac:
+                await interaction.followup.send("❌ Request not found!", ephemeral=True); return
+            await db.execute('UPDATE vacations SET status = "approved" WHERE id = ?', (vacation_id,))
+            await db.commit()
+        user_id, start, end = vac
+        embed = discord.Embed(title="✅ Vacation Approved",
+            description=f"**Employee:** <@{user_id}>\n**Period:** {start} — {end}\n**Approved by:** {interaction.user.mention}",
+            color=discord.Color.green(), timestamp=now_tz())
+        embed.set_footer(text=f"ID:{vacation_id}")
+        await message.edit(embed=embed, view=None)
+        try:
+            user = await bot.fetch_user(user_id)
+            if user:
+                dm = discord.Embed(title="✅ Your vacation has been approved!",
+                    description=f"**From:** {start}\n**To:** {end}",
+                    color=discord.Color.green(), timestamp=now_tz())
+                await user.send(embed=dm)
+        except: pass
+
+    @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.danger, custom_id="vacation_reject")
+    async def reject_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Only admins can reject!", ephemeral=True); return
+        message = interaction.message
+        vacation_id = None
+        if message.embeds and message.embeds[0].footer:
+            footer = message.embeds[0].footer.text
+            if "ID:" in footer:
+                try: vacation_id = int(footer.split("ID:")[1].strip().split()[0])
+                except: pass
+        if not vacation_id:
+            await interaction.response.send_message("❌ Cannot find vacation ID!", ephemeral=True); return
+        await interaction.response.defer()
+        async with aiosqlite.connect('shifts.db') as db:
+            cursor = await db.execute('SELECT user_id, start_date, end_date FROM vacations WHERE id = ?', (vacation_id,))
+            vac = await cursor.fetchone()
+            if not vac:
+                await interaction.followup.send("❌ Request not found!", ephemeral=True); return
+            await db.execute('UPDATE vacations SET status = "cancelled" WHERE id = ?', (vacation_id,))
+            await db.commit()
+        user_id, start, end = vac
+        embed = discord.Embed(title="❌ Vacation Rejected",
+            description=f"**Employee:** <@{user_id}>\n**Period:** {start} — {end}\n**Rejected by:** {interaction.user.mention}",
+            color=discord.Color.red(), timestamp=now_tz())
+        embed.set_footer(text=f"ID:{vacation_id}")
+        await message.edit(embed=embed, view=None)
+        try:
+            user = await bot.fetch_user(user_id)
+            if user:
+                dm = discord.Embed(title="❌ Your vacation has been rejected",
+                    description=f"**Period:** {start} — {end}",
+                    color=discord.Color.red(), timestamp=now_tz())
+                await user.send(embed=dm)
+        except: pass
+
+# ==================== SLOT VIEW ====================
+class SlotNotificationView(discord.ui.View):
+    def __init__(self, guild_id, free_slots):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        if free_slots:
+            options = [discord.SelectOption(label=f"{s[1]} - {s[2]}", description=f"Free: {s[3]} spots", value=str(s[0])) for s in free_slots[:25]]
+            select = discord.ui.Select(placeholder="📅 Choose your shift...", options=options)
+            select.callback = self.select_callback
+            self.add_item(select)
+    async def select_callback(self, interaction: discord.Interaction):
+        slot_id = int(interaction.data['values'][0])
+        result = await book_slot(slot_id, interaction.user.id, interaction.user.name, interaction.guild_id)
+        if result == "success":
+            await interaction.response.send_message("✅ Booked!", ephemeral=True)
+            await update_slot_notification(interaction.guild_id)
+        elif result == "full":
+            await interaction.response.send_message("❌ Slot is full.", ephemeral=True)
+        elif result == "already_booked":
+            await interaction.response.send_message("❌ Already booked.", ephemeral=True)
+        elif result == "on_vacation":
+            await interaction.response.send_message("🏖️ You are on vacation!", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Slot not found.", ephemeral=True)
+
+# ==================== SHIFT PANEL VIEW ====================
+class ShiftPanelView(discord.ui.View):
+    def __init__(self, user_id, is_active, today_slots, my_bookings):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        if not is_active:
+            self.add_item(discord.ui.Button(label="▶️ Start Shift Now", style=discord.ButtonStyle.success, custom_id="start_shift_button", row=0))
+        else:
+            self.add_item(discord.ui.Button(label="⏹️ End Shift", style=discord.ButtonStyle.danger, custom_id="end_shift_button", row=0))
+        self.add_item(discord.ui.Button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, custom_id="refresh_button", row=0))
+        free_slots = [(s[0], s[1], s[2], s[3] - s[4]) for s in today_slots if s[3] - s[4] > 0]
+        if free_slots:
+            options = [discord.SelectOption(label=f"Book: {s[1]}-{s[2]}", description=f"{s[3]} spots left", value=f"book_{s[0]}") for s in free_slots[:25]]
+            select = discord.ui.Select(placeholder="📅 Book a shift slot...", options=options, row=1)
+            select.callback = self.book_callback
+            self.add_item(select)
+        if my_bookings:
+            options = [discord.SelectOption(label=f"Cancel: {b[2]}-{b[3]}", description=f"{day_name(b[4])}", value=f"cancel_{b[0]}") for b in my_bookings[:25]]
+            cs = discord.ui.Select(placeholder="❌ Cancel booking...", options=options, row=2)
+            cs.callback = self.cancel_callback
+            self.add_item(cs)
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Not your panel!", ephemeral=True)
+            return False
+        return True
+    async def book_callback(self, interaction):
+        slot_id = int(interaction.data['values'][0].replace('book_', ''))
+        await interaction.response.defer(ephemeral=True)
+        result = await book_slot(slot_id, interaction.user.id, interaction.user.name, interaction.guild_id)
+        msgs = {"success": "✅ Slot booked!", "full": "❌ Slot is full.", "already_booked": "❌ Already booked.", "not_found": "❌ Not found.", "on_vacation": "🏖️ You are on vacation!"}
+        await interaction.followup.send(msgs.get(result, "❌ Error"), ephemeral=True)
+        await update_slot_notification(interaction.guild_id)
+        await asyncio.sleep(1)
+        await create_shift_panel(interaction, edit=True)
+    async def cancel_callback(self, interaction):
+        booking_id = int(interaction.data['values'][0].replace('cancel_', ''))
+        await interaction.response.defer(ephemeral=True)
+        if await cancel_booking(booking_id, interaction.user.id):
+            await interaction.followup.send("✅ Booking cancelled.", ephemeral=True)
+            await update_slot_notification(interaction.guild_id)
+        else:
+            await interaction.followup.send("❌ Could not cancel.", ephemeral=True)
+        await asyncio.sleep(1)
+        await create_shift_panel(interaction, edit=True)
+
+# ==================== SHIFT PANEL ====================
 async def create_shift_panel(interaction: discord.Interaction, edit: bool = False):
     try:
         async with aiosqlite.connect('shifts.db') as db:
@@ -932,59 +1071,7 @@ async def create_shift_panel(interaction: discord.Interaction, edit: bool = Fals
         print(f"❌ Panel error: {e}")
         if not edit: await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-# --- SHIFT PANEL VIEW ---
-class ShiftPanelView(discord.ui.View):
-    def __init__(self, user_id, is_active, today_slots, my_bookings):
-        super().__init__(timeout=300)
-        self.user_id = user_id
-        if not is_active:
-            self.add_item(discord.ui.Button(label="▶️ Start Shift Now", style=discord.ButtonStyle.success, custom_id="start_shift_button", row=0))
-        else:
-            self.add_item(discord.ui.Button(label="⏹️ End Shift", style=discord.ButtonStyle.danger, custom_id="end_shift_button", row=0))
-        self.add_item(discord.ui.Button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, custom_id="refresh_button", row=0))
-        free_slots = [(s[0], s[1], s[2], s[3] - s[4]) for s in today_slots if s[3] - s[4] > 0]
-        if free_slots:
-            options = [discord.SelectOption(label=f"Book: {s[1]}-{s[2]}", description=f"{s[3]} spots left", value=f"book_{s[0]}") for s in free_slots[:25]]
-            select = discord.ui.Select(placeholder="📅 Book a shift slot...", options=options, row=1)
-            select.callback = self.book_callback
-            self.add_item(select)
-        if my_bookings:
-            options = [discord.SelectOption(label=f"Cancel: {b[2]}-{b[3]}", description=f"{day_name(b[4])}", value=f"cancel_{b[0]}") for b in my_bookings[:25]]
-            cs = discord.ui.Select(placeholder="❌ Cancel booking...", options=options, row=2)
-            cs.callback = self.cancel_callback
-            self.add_item(cs)
-    async def interaction_check(self, interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ Not your panel!", ephemeral=True)
-            return False
-        return True
-    async def book_callback(self, interaction):
-        slot_id = int(interaction.data['values'][0].replace('book_', ''))
-        await interaction.response.defer(ephemeral=True)
-        result = await book_slot(slot_id, interaction.user.id, interaction.user.name, interaction.guild_id)
-        msgs = {
-            "success": "✅ Slot booked!", 
-            "full": "❌ Slot is full.", 
-            "already_booked": "❌ Already booked.", 
-            "not_found": "❌ Not found.",
-            "on_vacation": "🏖️ You are on vacation! Cannot book slots."
-        }
-        await interaction.followup.send(msgs.get(result, "❌ Error"), ephemeral=True)
-        await update_slot_notification(interaction.guild_id)
-        await asyncio.sleep(1)
-        await create_shift_panel(interaction, edit=True)
-    async def cancel_callback(self, interaction):
-        booking_id = int(interaction.data['values'][0].replace('cancel_', ''))
-        await interaction.response.defer(ephemeral=True)
-        if await cancel_booking(booking_id, interaction.user.id):
-            await interaction.followup.send("✅ Booking cancelled.", ephemeral=True)
-            await update_slot_notification(interaction.guild_id)
-        else:
-            await interaction.followup.send("❌ Could not cancel.", ephemeral=True)
-        await asyncio.sleep(1)
-        await create_shift_panel(interaction, edit=True)
-
-# --- READY ---
+# ==================== READY ====================
 @bot.event
 async def on_ready():
     await init_db()
@@ -1007,6 +1094,8 @@ async def on_ready():
     bot.loop.create_task(reminder_14_loop())
     bot.loop.create_task(auto_publish_next_week())
     bot.loop.create_task(cleanup_yesterday())
+    bot.loop.create_task(auto_close_shifts())
+    bot.loop.create_task(cleanup_hung_roles())
 
 # ==================== USER COMMANDS ====================
 @bot.tree.command(name='shift', description='📋 Manage your shift and book slots')
@@ -1107,8 +1196,7 @@ async def vacation_cmd(interaction: discord.Interaction, start: str, end: str):
         start_dt = datetime.strptime(start, "%d.%m.%Y")
         end_dt = datetime.strptime(end, "%d.%m.%Y")
     except:
-        await interaction.followup.send("❌ Invalid format! Use DD.MM.YYYY", ephemeral=True)
-        return
+        await interaction.followup.send("❌ Invalid format! Use DD.MM.YYYY", ephemeral=True); return
     if end_dt < start_dt:
         await interaction.followup.send("❌ End date is before start date!", ephemeral=True); return
     async with aiosqlite.connect('shifts.db') as db:
@@ -1118,21 +1206,25 @@ async def vacation_cmd(interaction: discord.Interaction, start: str, end: str):
         ''', (interaction.user.id, interaction.user.name, interaction.guild_id,
               start_dt.date().isoformat(), end_dt.date().isoformat(), now_tz().isoformat()))
         await db.commit()
+        cursor = await db.execute('SELECT id FROM vacations WHERE user_id = ? AND guild_id = ? ORDER BY id DESC LIMIT 1',
+                                  (interaction.user.id, interaction.guild_id))
+        vacation_id = (await cursor.fetchone())[0]
     days = (end_dt - start_dt).days + 1
     embed = discord.Embed(title="🏖️ Vacation Request Sent",
         description=f"**From:** {start}\n**To:** {end}\n**Days:** {days}",
         color=discord.Color.blue(), timestamp=now_tz())
     embed.set_footer(text="Awaiting admin approval")
     await interaction.followup.send(embed=embed, ephemeral=True)
-    # ✅ Send to vacation channel
     try:
         channel = bot.get_channel(VACATION_CHANNEL_ID)
         if channel:
             admin_embed = discord.Embed(title="🏖️ New Vacation Request",
-                description=f"**{interaction.user.mention}** requests a vacation\n**From:** {start} **To:** {end} ({days} days)",
+                description=f"**{interaction.user.mention}** requests a vacation\n**From:** {start}\n**To:** {end}\n**Days:** {days}",
                 color=discord.Color.blue(), timestamp=now_tz())
-            admin_embed.set_footer(text=f"User ID: {interaction.user.id}")
-            await channel.send(embed=admin_embed)
+            admin_embed.set_footer(text=f"ID:{vacation_id}")
+            admin_mentions = " ".join([f"<@&{rid}>" for rid in ADMIN_ROLE_IDS])
+            view = VacationRequestView()
+            await channel.send(content=admin_mentions, embed=admin_embed, view=view)
     except Exception as e:
         print(f"❌ Vacation channel error: {e}")
 
@@ -1158,15 +1250,15 @@ async def sick_cmd(interaction: discord.Interaction, start: str, end: str):
         description=f"**From:** {start}\n**To:** {end}\n**Days:** {days}",
         color=discord.Color.orange(), timestamp=now_tz())
     await interaction.followup.send(embed=embed, ephemeral=True)
-    # ✅ Send to vacation channel
     try:
         channel = bot.get_channel(VACATION_CHANNEL_ID)
         if channel:
             admin_embed = discord.Embed(title="🤒 New Sick Leave",
-                description=f"**{interaction.user.mention}** is on sick leave\n**From:** {start} **To:** {end} ({days} days)",
+                description=f"**{interaction.user.mention}** is on sick leave\n**From:** {start}\n**To:** {end}\n**Days:** {days}",
                 color=discord.Color.orange(), timestamp=now_tz())
-            admin_embed.set_footer(text=f"User ID: {interaction.user.id} ✅ Auto-approved")
-            await channel.send(embed=admin_embed)
+            admin_embed.set_footer(text="Auto-approved")
+            admin_mentions = " ".join([f"<@&{rid}>" for rid in ADMIN_ROLE_IDS])
+            await channel.send(content=admin_mentions, embed=admin_embed)
     except Exception as e:
         print(f"❌ Sick channel error: {e}")
 
@@ -1175,7 +1267,7 @@ async def my_vacations_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     async with aiosqlite.connect('shifts.db') as db:
         cursor = await db.execute('''
-            SELECT start_date, end_date, type, status FROM vacations
+            SELECT id, start_date, end_date, type, status FROM vacations
             WHERE user_id = ? AND guild_id = ? AND end_date >= ?
             ORDER BY start_date DESC
         ''', (interaction.user.id, interaction.guild_id, now_tz().date().isoformat()))
@@ -1183,12 +1275,57 @@ async def my_vacations_cmd(interaction: discord.Interaction):
     if not vacations:
         await interaction.followup.send("📭 You have no active vacations.", ephemeral=True); return
     embed = discord.Embed(title="📋 My Vacations", color=discord.Color.blue(), timestamp=now_tz())
-    for start, end, vtype, status in vacations:
+    for vid, start, end, vtype, status in vacations:
         type_emoji = "🏖️" if vtype == "vacation" else "🤒"
         status_emoji = {"pending": "⏳", "approved": "✅", "cancelled": "❌"}.get(status, "")
-        embed.add_field(name=f"{type_emoji} {start} — {end} {status_emoji}",
+        embed.add_field(name=f"{type_emoji} ID: {vid} {start} — {end} {status_emoji}",
             value=f"Type: {vtype}\nStatus: {status}", inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name='cancel-my-vacation', description='❌ Cancel your own vacation')
+async def cancel_my_vacation_cmd(interaction: discord.Interaction, vacation_id: int = None):
+    await interaction.response.defer(ephemeral=True)
+    async with aiosqlite.connect('shifts.db') as db:
+        if vacation_id is None:
+            cursor = await db.execute('''
+                SELECT id, start_date, end_date, type, status FROM vacations
+                WHERE user_id = ? AND guild_id = ? AND status = 'approved' AND end_date >= ?
+                ORDER BY start_date
+            ''', (interaction.user.id, interaction.guild_id, now_tz().date().isoformat()))
+            vacations = await cursor.fetchall()
+            if not vacations:
+                await interaction.followup.send("📭 You have no active vacations to cancel.", ephemeral=True); return
+            embed = discord.Embed(title="📋 Your Active Vacations",
+                description="To cancel, use `/cancel-my-vacation vacation_id:X`",
+                color=discord.Color.blue(), timestamp=now_tz())
+            for vid, start, end, vtype, status in vacations:
+                type_emoji = "🏖️" if vtype == "vacation" else "🤒"
+                embed.add_field(name=f"{type_emoji} ID: {vid}",
+                    value=f"**Period:** {start} — {end}\n**Type:** {vtype}", inline=False)
+            await interaction.followup.send(embed=embed, ephemeral=True); return
+        cursor = await db.execute('SELECT id, start_date, end_date, type, status FROM vacations WHERE id = ? AND user_id = ? AND guild_id = ?',
+                                  (vacation_id, interaction.user.id, interaction.guild_id))
+        vac = await cursor.fetchone()
+        if not vac:
+            await interaction.followup.send(f"❌ Vacation `{vacation_id}` not found or does not belong to you.", ephemeral=True); return
+        vid, start, end, vtype, status = vac
+        if status == "cancelled":
+            await interaction.followup.send("⚠️ Already cancelled.", ephemeral=True); return
+        await db.execute('UPDATE vacations SET status = "cancelled" WHERE id = ?', (vacation_id,))
+        await db.commit()
+    type_emoji = "🏖️" if vtype == "vacation" else "🤒"
+    embed = discord.Embed(title="✅ Vacation Cancelled",
+        description=f"{type_emoji} Your vacation **{start} — {end}** has been cancelled.",
+        color=discord.Color.green(), timestamp=now_tz())
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    try:
+        channel = bot.get_channel(VACATION_CHANNEL_ID)
+        if channel:
+            admin_embed = discord.Embed(title="❌ Vacation Cancelled by User",
+                description=f"**Employee:** {interaction.user.mention}\n**Period:** {start} — {end}\n**Type:** {vtype}",
+                color=discord.Color.orange(), timestamp=now_tz())
+            await channel.send(embed=admin_embed)
+    except: pass
 
 # ==================== EXPORT COMMANDS ====================
 @bot.tree.command(name='export', description='📤 Export all shifts to CSV (admin)')
@@ -1197,12 +1334,10 @@ async def export_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("❌ No access!", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     async with aiosqlite.connect('shifts.db') as db:
-        cursor = await db.execute('''
-            SELECT username, start_time, end_time, 
+        cursor = await db.execute('''SELECT username, start_time, end_time,
                    (strftime('%s', end_time) - strftime('%s', start_time)) / 3600.0 as hours
-            FROM shifts WHERE guild_id = ? AND is_active = 0 AND end_time IS NOT NULL
-            ORDER BY start_time DESC
-        ''', (interaction.guild_id,))
+            FROM shifts WHERE guild_id = ? AND is_active = 0 AND end_time IS NOT NULL ORDER BY start_time DESC''',
+            (interaction.guild_id,))
         shifts = await cursor.fetchall()
     if not shifts:
         await interaction.followup.send("📭 No data.", ephemeral=True); return
@@ -1212,9 +1347,8 @@ async def export_cmd(interaction: discord.Interaction):
     for username, start, end, hours in shifts:
         writer.writerow([username, start[:16], end[:16], f"{hours:.2f}"])
     output.seek(0)
-    file = discord.File(io.BytesIO(output.getvalue().encode('utf-8-sig')),
-                        filename=f"shifts_all_{now_tz().strftime('%Y-%m-%d')}.csv")
-    await interaction.followup.send(f"📤 Export of all shifts ({len(shifts)} records):", file=file)
+    file = discord.File(io.BytesIO(output.getvalue().encode('utf-8-sig')), filename=f"shifts_all_{now_tz().strftime('%Y-%m-%d')}.csv")
+    await interaction.followup.send(f"📤 Export ({len(shifts)} records):", file=file)
 
 @bot.tree.command(name='export-month', description='📤 Export shifts for the month to CSV (admin)')
 async def export_month_cmd(interaction: discord.Interaction):
@@ -1224,12 +1358,10 @@ async def export_month_cmd(interaction: discord.Interaction):
     now = now_tz()
     month_start = now.replace(day=1, hour=0, minute=0, second=0)
     async with aiosqlite.connect('shifts.db') as db:
-        cursor = await db.execute('''
-            SELECT username, start_time, end_time,
+        cursor = await db.execute('''SELECT username, start_time, end_time,
                    (strftime('%s', end_time) - strftime('%s', start_time)) / 3600.0 as hours
-            FROM shifts WHERE guild_id = ? AND is_active = 0 AND end_time IS NOT NULL
-            AND start_time >= ? ORDER BY start_time DESC
-        ''', (interaction.guild_id, month_start.isoformat()))
+            FROM shifts WHERE guild_id = ? AND is_active = 0 AND end_time IS NOT NULL AND start_time >= ? ORDER BY start_time DESC''',
+            (interaction.guild_id, month_start.isoformat()))
         shifts = await cursor.fetchall()
     if not shifts:
         await interaction.followup.send("📭 No data for the month.", ephemeral=True); return
@@ -1239,8 +1371,7 @@ async def export_month_cmd(interaction: discord.Interaction):
     for username, start, end, hours in shifts:
         writer.writerow([username, start[:16], end[:16], f"{hours:.2f}"])
     output.seek(0)
-    file = discord.File(io.BytesIO(output.getvalue().encode('utf-8-sig')),
-                        filename=f"shifts_{now.strftime('%Y-%m')}.csv")
+    file = discord.File(io.BytesIO(output.getvalue().encode('utf-8-sig')), filename=f"shifts_{now.strftime('%Y-%m')}.csv")
     await interaction.followup.send(f"📤 Export for {now.strftime('%B %Y')} ({len(shifts)} records):", file=file)
 
 @bot.tree.command(name='export-user', description='📤 Export user shifts to CSV (admin)')
@@ -1249,12 +1380,10 @@ async def export_user_cmd(interaction: discord.Interaction, user: discord.Member
         await interaction.response.send_message("❌ No access!", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     async with aiosqlite.connect('shifts.db') as db:
-        cursor = await db.execute('''
-            SELECT start_time, end_time,
+        cursor = await db.execute('''SELECT start_time, end_time,
                    (strftime('%s', end_time) - strftime('%s', start_time)) / 3600.0 as hours
-            FROM shifts WHERE user_id = ? AND guild_id = ? AND is_active = 0 AND end_time IS NOT NULL
-            ORDER BY start_time DESC
-        ''', (user.id, interaction.guild_id))
+            FROM shifts WHERE user_id = ? AND guild_id = ? AND is_active = 0 AND end_time IS NOT NULL ORDER BY start_time DESC''',
+            (user.id, interaction.guild_id))
         shifts = await cursor.fetchall()
     if not shifts:
         await interaction.followup.send(f"📭 {user.mention} has no shifts.", ephemeral=True); return
@@ -1268,8 +1397,7 @@ async def export_user_cmd(interaction: discord.Interaction, user: discord.Member
     writer.writerow([])
     writer.writerow(["TOTAL", "", f"{total:.2f}"])
     output.seek(0)
-    file = discord.File(io.BytesIO(output.getvalue().encode('utf-8-sig')),
-                        filename=f"shifts_{user.name}_{now_tz().strftime('%Y-%m-%d')}.csv")
+    file = discord.File(io.BytesIO(output.getvalue().encode('utf-8-sig')), filename=f"shifts_{user.name}_{now_tz().strftime('%Y-%m-%d')}.csv")
     await interaction.followup.send(f"📤 Shifts of {user.mention} ({len(shifts)} records):", file=file)
 
 # ==================== ADMIN COMMANDS ====================
@@ -1574,9 +1702,6 @@ async def test_rep(interaction: discord.Interaction):
     if stats:
         total_s = sum(s[3] for s in stats if s[3])
         embed.add_field(name="📈 Summary", value=f"Employees: {len(stats)}\nShifts: {sum(s[2] for s in stats)}\nHours: {format_time(total_s)}", inline=False)
-        medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-        for i, (uid, uname, sh, secs) in enumerate(stats[:10], 1):
-            embed.add_field(name=f"{medals[i-1]} {uname}", value=f"{sh} shifts, {format_time(secs)}", inline=False)
     else:
         embed.description = "📭 No shifts this month"
     await interaction.followup.send(embed=embed)
@@ -1626,14 +1751,6 @@ async def approve_vacation_cmd(interaction: discord.Interaction, vacation_id: in
                 color=discord.Color.green(), timestamp=now_tz())
             await user.send(embed=embed)
     except: pass
-    try:
-        channel = bot.get_channel(VACATION_CHANNEL_ID)
-        if channel:
-            embed = discord.Embed(title="✅ Vacation Approved",
-                description=f"**Employee:** <@{user_id}>\n**Period:** {start} — {end}\n**Approved by:** {interaction.user.mention}",
-                color=discord.Color.green(), timestamp=now_tz())
-            await channel.send(embed=embed)
-    except: pass
 
 @bot.tree.command(name='cancel-vacation', description='❌ Cancel vacation (admin)')
 async def cancel_vacation_cmd(interaction: discord.Interaction, vacation_id: int):
@@ -1650,22 +1767,6 @@ async def cancel_vacation_cmd(interaction: discord.Interaction, vacation_id: int
         await db.commit()
     user_id, start, end = vac
     await interaction.followup.send(f"✅ Vacation cancelled for <@{user_id}>", ephemeral=True)
-    try:
-        user = await bot.fetch_user(user_id)
-        if user:
-            embed = discord.Embed(title="❌ Your vacation has been cancelled",
-                description=f"**Period:** {start} — {end}",
-                color=discord.Color.red(), timestamp=now_tz())
-            await user.send(embed=embed)
-    except: pass
-    try:
-        channel = bot.get_channel(VACATION_CHANNEL_ID)
-        if channel:
-            embed = discord.Embed(title="❌ Vacation Cancelled",
-                description=f"**Employee:** <@{user_id}>\n**Period:** {start} — {end}\n**Cancelled by:** {interaction.user.mention}",
-                color=discord.Color.red(), timestamp=now_tz())
-            await channel.send(embed=embed)
-    except: pass
 
 # ==================== FORCE END SHIFTS ====================
 @bot.tree.command(name='force-end-shift', description='🔧 Force end an employee\'s shift (admin)')
@@ -1704,13 +1805,13 @@ async def force_end_all(interaction: discord.Interaction):
         await interaction.response.send_message("❌ No access!", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     async with aiosqlite.connect('shifts.db') as db:
-        cursor = await db.execute('SELECT id, user_id, username, start_time FROM shifts WHERE guild_id = ? AND is_active = 1',
+        cursor = await db.execute('SELECT id, user_id FROM shifts WHERE guild_id = ? AND is_active = 1',
                                   (interaction.guild_id,))
         shifts = await cursor.fetchall()
         if not shifts:
             await interaction.followup.send("📭 No active shifts.", ephemeral=True); return
         now = now_tz()
-        for shift_id, user_id, username, start_time in shifts:
+        for shift_id, user_id in shifts:
             await db.execute('UPDATE shifts SET end_time = ?, is_active = 0 WHERE id = ?', (now.isoformat(), shift_id))
             await remove_on_shift_role(interaction.guild, user_id)
         await db.commit()
@@ -1754,7 +1855,22 @@ async def cleanup_now(interaction: discord.Interaction):
         await db.commit()
     await interaction.followup.send(f"✅ Cleanup for {yesterday}!\n• Shifts: **{deleted_shifts}**\n• Bookings: **{deleted_bookings}**")
 
-# --- BUTTON HANDLERS ---
+@bot.tree.command(name='reset-all-shifts', description='🔧 Close ALL shifts and remove roles (admin)')
+async def reset_all_shifts(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ No access!", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    now = now_tz()
+    async with aiosqlite.connect('shifts.db') as db:
+        cursor = await db.execute('SELECT id, user_id FROM shifts WHERE guild_id = ? AND is_active = 1', (interaction.guild_id,))
+        active = await cursor.fetchall()
+        for shift_id, user_id in active:
+            await db.execute('UPDATE shifts SET end_time = ?, is_active = 0 WHERE id = ?', (now.isoformat(), shift_id))
+            await remove_on_shift_role(interaction.guild, user_id)
+        await db.commit()
+    await interaction.followup.send(f"✅ Closed **{len(active)}** shifts and removed roles.")
+
+# ==================== BUTTON HANDLERS ====================
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     if interaction.type != discord.InteractionType.component: return
@@ -1763,8 +1879,7 @@ async def on_interaction(interaction: discord.Interaction):
     try:
         if cid == 'start_shift_button':
             if await is_on_vacation(interaction.user.id, interaction.guild_id):
-                await interaction.response.send_message("🏖️ You are on vacation! Cannot start a shift.", ephemeral=True)
-                return
+                await interaction.response.send_message("🏖️ You are on vacation! Cannot start a shift.", ephemeral=True); return
             if await start_shift(interaction.user.id, interaction.user.name, interaction.guild_id):
                 await interaction.response.defer()
                 await add_on_shift_role(interaction.guild, interaction.user.id)
@@ -1791,7 +1906,7 @@ async def on_interaction(interaction: discord.Interaction):
     except discord.errors.InteractionResponded: pass
     except Exception as e: print(f"❌ on_interaction error: {e}")
 
-# --- LAUNCH ---
+# ==================== LAUNCH ====================
 if __name__ == '__main__':
     try: bot.run(TOKEN)
     except Exception as e: print(f"❌ Launch error: {e}")
